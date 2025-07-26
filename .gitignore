@@ -1,0 +1,11 @@
+# Secrets & runtime state
+credentials.json
+token.json
+sync_state.json
+quarantine.txt
+outbox/
+logs/
+*.log
+.venv/
+__pycache__/
+.DS_Store
