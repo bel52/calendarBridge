@@ -6,6 +6,10 @@ quarantine.txt
 outbox/
 logs/
 *.log
+
+# Local env / build artefacts
 .venv/
 __pycache__/
+
+# macOS cruft
 .DS_Store
