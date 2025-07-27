@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>               <string>com.calendarBridge.full_sync</string>
+
+    <!-- Run every hour on the hour -->
+    <key>StartCalendarInterval</key>
+    <dict>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <!-- Absolute path to the master script -->
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/bel/calendarBridge/full_sync.sh</string>
+    </array>
+
+    <!-- Environment: make sure our venv is first in PATH -->
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>/Users/bel/calendarBridge/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- If the Mac is asleep at :00, run when it wakes -->
+    <key>LaunchOnlyOnce</key>      <false/>
+    <key>RunAtLoad</key>           <true/>
+    <key>StandardOutPath</key>     <string>/Users/bel/calendarBridge/logs/launchd.out</string>
+    <key>StandardErrorPath</key>   <string>/Users/bel/calendarBridge/logs/launchd.err</string>
+  </dict>
+</plist>

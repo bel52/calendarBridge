@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+import os
+import json
+import datetime
+import hashlib
+from icalendar import Calendar
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.errors import HttpError
+
+# Configuration
+OUTBOX = os.path.expanduser("~/calendarBridge/outbox")
+TOKEN_FILE = os.path.expanduser("~/calendarBridge/token.json")
+CREDS_FILE = os.path.expanduser("~/calendarBridge/credentials.json")
+SYNC_STATE_FILE = os.path.expanduser("~/calendarBridge/sync_state.json")
+SCOPES = ['https://www.googleapis.com/auth/calendar']
+CALENDAR_ID = 'primary'
+
+# Create directories
+os.makedirs(OUTBOX, exist_ok=True)
+
+# Load sync state (to avoid duplicates)
+sync_state = {}
+if os.path.exists(SYNC_STATE_FILE):
+    try:
+        with open(SYNC_STATE_FILE, 'r') as f:
+            sync_state = json.load(f)
+    except:
+        sync_state = {}
+
+# Authenticate with Google
+print("Authenticating with Google Calendar...")
+creds = None
+
+if os.path.exists(TOKEN_FILE):
+    creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+
+if not creds or not creds.valid:
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
+        creds = flow.run_local_server(port=0)
+    
+    # Save the credentials for next run
+    with open(TOKEN_FILE, 'w') as token:
+        token.write(creds.to_json())
+
+# Build the service
+try:
+    service = build('calendar', 'v3', credentials=creds)
+    print("✓ Connected to Google Calendar")
+except Exception as e:
+    print(f"❌ Error connecting to Google Calendar: {e}")
+    exit(1)
+
+# Process ICS files
+inserted = 0
+updated = 0
+skipped = 0
+errors = 0
+
+ics_files = sorted([f for f in os.listdir(OUTBOX) if f.endswith('.ics')])
+print(f"\nFound {len(ics_files)} ICS files to process")
+
+for filename in ics_files:
+    filepath = os.path.join(OUTBOX, filename)
+    print(f"\nProcessing: {filename}")
+    
+    try:
+        with open(filepath, 'rb') as f:
+            cal = Calendar.from_ical(f.read())
+        
+        for component in cal.walk():
+            if component.name == "VEVENT":
+                # Extract event data
+                summary = str(component.get('SUMMARY', 'Untitled Event'))
+                uid = str(component.get('UID', ''))
+                description = component.get('DESCRIPTION', '')
+                location = component.get('LOCATION', '')
+                
+                # Clean up description and location
+                if description:
+                    description = str(description).strip()
+                    if description.lower() in ['none', 'null', '']:
+                        description = None
+                
+                if location:
+                    location = str(location).strip()
+                    if location.lower() in ['none', 'null', '']:
+                        location = None
+                
+                # Get dates
+                dtstart = component.get('DTSTART')
+                dtend = component.get('DTEND')
+                
+                if not dtstart:
+                    print(f"  ⚠️  Skipping event without start date: {summary}")
+                    continue
+                
+                # Extract datetime
+                start_dt = dtstart.dt if hasattr(dtstart, 'dt') else dtstart
+                end_dt = dtend.dt if dtend and hasattr(dtend, 'dt') else dtend
+                
+                # Skip past events
+                now = datetime.datetime.now()
+                if hasattr(start_dt, 'date'):
+                    if start_dt.date() < now.date():
+                        print(f"  ⏭️  Skipping past event: {summary}")
+                        skipped += 1
+                        continue
+                
+                # Create unique hash for this event
+                event_hash = hashlib.md5(f"{uid}{summary}{start_dt}".encode()).hexdigest()
+                
+                # Check if we've already synced this exact event
+                if event_hash in sync_state.get('synced', []):
+                    print(f"  ✓ Already synced: {summary}")
+                    skipped += 1
+                    continue
+                
+                # Format dates for Google Calendar
+                if isinstance(start_dt, datetime.date) and not isinstance(start_dt, datetime.datetime):
+                    # All-day event
+                    event = {
+                        'summary': summary,
+                        'start': {'date': start_dt.isoformat()},
+                        'end': {'date': (end_dt or start_dt + datetime.timedelta(days=1)).isoformat()}
+                    }
+                else:
+                    # Timed event
+                    event = {
+                        'summary': summary,
+                        'start': {'dateTime': start_dt.isoformat()},
+                        'end': {'dateTime': (end_dt or start_dt + datetime.timedelta(hours=1)).isoformat()}
+                    }
+                    
+                    # Add timezone if missing
+                    if not hasattr(start_dt, 'tzinfo') or start_dt.tzinfo is None:
+                        event['start']['timeZone'] = 'America/New_York'
+                        event['end']['timeZone'] = 'America/New_York'
+                
+                # Add optional fields
+                if description:
+                    event['description'] = description
+                if location:
+                    event['location'] = location
+                
+                # Add a custom property to track Outlook events
+                if uid:
+                    event['extendedProperties'] = {
+                        'private': {
+                            'outlookUID': uid,
+                            'syncHash': event_hash
+                        }
+                    }
+                
+                # Try to insert the event
+                try:
+                    # Check if this event already exists
+                    if uid:
+                        existing = service.events().list(
+                            calendarId=CALENDAR_ID,
+                            privateExtendedProperty=f'outlookUID={uid}',
+                            showDeleted=False,
+                            singleEvents=True,
+                            maxResults=1
+                        ).execute().get('items', [])
+                        
+                        if existing:
+                            # Update existing event
+                            event_id = existing[0]['id']
+                            result = service.events().update(
+                                calendarId=CALENDAR_ID,
+                                eventId=event_id,
+                                body=event
+                            ).execute()
+                            print(f"  📝 Updated: {summary}")
+                            updated += 1
+                        else:
+                            # Insert new event
+                            result = service.events().insert(
+                                calendarId=CALENDAR_ID,
+                                body=event
+                            ).execute()
+                            print(f"  ✅ Added: {summary}")
+                            inserted += 1
+                    else:
+                        # No UID, just insert
+                        result = service.events().insert(
+                            calendarId=CALENDAR_ID,
+                            body=event
+                        ).execute()
+                        print(f"  ✅ Added: {summary}")
+                        inserted += 1
+                    
+                    # Mark as synced
+                    if 'synced' not in sync_state:
+                        sync_state['synced'] = []
+                    sync_state['synced'].append(event_hash)
+                    
+                except HttpError as e:
+                    error_msg = str(e)
+                    if 'already exists' in error_msg.lower():
+                        print(f"  ⏭️  Duplicate: {summary}")
+                        skipped += 1
+                    else:
+                        print(f"  ❌ Error: {error_msg}")
+                        errors += 1
+                except Exception as e:
+                    print(f"  ❌ Error: {str(e)}")
+                    errors += 1
+    
+    except Exception as e:
+        print(f"❌ Error reading {filename}: {str(e)}")
+        errors += 1
+    
+    finally:
+        # Always try to remove the processed file
+        try:
+            os.remove(filepath)
+        except:
+            pass
+
+# Save sync state
+with open(SYNC_STATE_FILE, 'w') as f:
+    json.dump(sync_state, f, indent=2)
+
+# Clean up old sync state entries (keep only last 1000)
+if len(sync_state.get('synced', [])) > 1000:
+    sync_state['synced'] = sync_state['synced'][-1000:]
+    with open(SYNC_STATE_FILE, 'w') as f:
+        json.dump(sync_state, f, indent=2)
+
+# Summary
+print("\n" + "="*50)
+print("📊 SYNC SUMMARY")
+print("="*50)
+print(f"✅ Added:    {inserted} events")
+print(f"📝 Updated:  {updated} events")
+print(f"⏭️  Skipped:  {skipped} events")
+print(f"❌ Errors:   {errors}")
+print(f"📁 Total:    {len(ics_files)} files processed")
+print("="*50)
