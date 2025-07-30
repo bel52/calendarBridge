@@ -1,15 +1,28 @@
-# Secrets & runtime state
-credentials.json
+# Existing rules
+Python/
+backups/
+create/
+private/
+*.bak
+*.sh~
+*.log
+.DS_Store
+
+# New exclusions for cleanup and runtime files
+delete_all_outlook_events.py
+clean_orphans.py
+remove_calendar_duplicates.py
+remove_synced_duplicates.py
+reset_calendar.sh
+test_calendar.sh
+
+# Runtime-generated files and directories
 token.json
 sync_state.json
-quarantine.txt
-outbox/
+synced_events.json
 logs/
-*.log
-
-# Local env / build artefacts
-.venv/
+outbox/
+archive/
 __pycache__/
-
-# macOS cruft
-.DS_Store
+*.pyc
+*.tmp
