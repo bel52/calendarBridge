@@ -1,81 +1,69 @@
--- AppleScript: exportEvents.scpt  (2025-07-29 window-aware)
--- Exports every Outlook calendar the Mac client can access,
--- but only events that INTERSECT a 127-day sliding window
---   ( 7 days back  ⟶  120 days ahead ).
+-- exportEvents.scpt – Outlook → ~/calendarBridge/outbox/ (.ics)
+-- • Deletes stale *.ics correctly          (rm line fixed)
+-- • Tiny 0.1-s delay per save (prevents -2700)
+-- • Logs bad UIDs to quarantine.txt
+-- • Uses iCalendar data for export (handles recurring events)
 
 on run
-    -- ─── Paths ────────────────────────────────────────────────
-    set homePath to path to home folder as text
-    set outboxPath to homePath & "calendarBridge:outbox:"
-    set posixOutbox to POSIX path of (path to home folder) & "calendarBridge/outbox/"
-
-    -- ─── Window definition ────────────────────────────────────
+    -- CONFIG --------------------------------------------------------------
+    set targetCalName  to "Calendar"
+    set targetCalIndex to 2
     set exportDaysBack to 7
     set exportDaysAhead to 120
+    -----------------------------------------------------------------------
+
+    -- Paths ---------------------------------------------------------------
+    set outboxFolder   to (path to home folder as text) & "calendarBridge:outbox:"
+    set posixOutbox    to POSIX path of outboxFolder
+    set quarantineFile to POSIX path of ((path to home folder as text) & "calendarBridge:quarantine.txt")
+
+    do shell script "mkdir -p " & quoted form of posixOutbox
+    -- ✨  wild-card OUTSIDE the quotes
+    do shell script "rm -f " & quoted form of posixOutbox & "*.ics"
+    do shell script "touch " & quoted form of quarantineFile
+
+    -- Date window ---------------------------------------------------------
     set startDate to (current date) - (exportDaysBack * days)
     set endDate   to (current date) + (exportDaysAhead * days)
 
-    -- ─── Misc config ──────────────────────────────────────────
-    set skipUIDs to {"5471", "5472"}
-
-    do shell script "mkdir -p " & quoted form of posixOutbox
-
     tell application "Microsoft Outlook"
-        try
-            set calList to calendars
-            if (count of calList) = 0 then error "❌ No calendars found in Outlook."
+        activate
+        set cals to every calendar whose name is targetCalName
+        if (count of cals) < targetCalIndex then error "Calendar index not found"
+        set targetCal to item targetCalIndex of cals
 
-            set totalExported to 0
-            set totalSkipped  to 0
-            set totalErrors   to 0
-            set globalEventIndex to 0
+        set evtsDateRange to (calendar events of targetCal ¬
+            whose start time ≥ startDate and start time ≤ endDate)
+        set evtsRecurring to (calendar events of targetCal ¬
+            whose recurrence is not missing value)
+        repeat with ev in evtsRecurring
+            if (ev is in evtsDateRange) is false then
+                copy ev to end of evtsDateRange
+            end if
+        end repeat
+        set evtsInRange to evtsDateRange
 
-            repeat with calIndex from 1 to count of calList
-                set thisCal to item calIndex of calList
-                set calName to name of thisCal
+        set exportedCount to 0
+        set skippedCount  to 0
 
-                -- Include ONLY events that overlap the window
-                set eventsInRange to calendar events of thisCal ¬
-                    whose start time ≤ endDate and end time ≥ startDate
-
-                repeat with evt in eventsInRange
-                    set globalEventIndex to globalEventIndex + 1
-                    try
-                        set evtID to id of evt as string
-                        if skipUIDs contains evtID then
-                            set totalSkipped to totalSkipped + 1
-                        else
-                            set safeUID to do shell script "echo " & quoted form of evtID & " | tr -cd '[:alnum:]_-.@'"
-                            if safeUID is "" then set safeUID to "cal" & calIndex & "_event_" & globalEventIndex
-                            set fileName to calName & "_" & safeUID & ".ics"
-                            set filePath to outboxPath & fileName
-
-                            try
-                                save evt in file filePath as "ics"
-                                set totalExported to totalExported + 1
-                            on error
-                                try
-                                    save evt in file (outboxPath & "event_" & globalEventIndex & ".ics") as "ics"
-                                    set totalExported to totalExported + 1
-                                on error
-                                    set totalErrors to totalErrors + 1
-                                end try
-                            end try
-                        end if
-                    on error
-                        set totalErrors to totalErrors + 1
-                    end try
-                end repeat
-            end repeat
-
-            set msg to "✅ Export complete. Exported " & totalExported & ¬
-                       ", skipped " & totalSkipped & ", errors: " & totalErrors
-            display notification msg with title "Calendar Bridge"
-            return msg
-
-        on error errAll
-            display dialog "❗️Fatal export error: " & errAll buttons {"OK"} default button "OK"
-            return "Error: " & errAll
-        end try
+        repeat with ev in evtsInRange
+            set uidStr to id of ev as string
+            try
+                set eventDetails to icalendar data of ev
+                set savePath to posixOutbox & uidStr & ".ics"
+                set fileRef to open for access (POSIX file savePath) with write permission
+                set eof of fileRef to 0
+                write eventDetails to fileRef
+                close access fileRef
+                set exportedCount to exportedCount + 1
+                delay 0.1
+            on error errm
+                log "❌ Skipped UID " & uidStr & " : " & errm
+                do shell script "echo " & quoted form of uidStr & " >> " & quoted form of quarantineFile
+                set skippedCount to skippedCount + 1
+            end try
+        end repeat
     end tell
+
+    log "✓ Exported " & exportedCount & " events, skipped " & skippedCount
 end run
