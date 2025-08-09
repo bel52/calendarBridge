@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-safe_sync.py  –  Outlook ➜ Google Calendar one-way sync
-
-• 60-second global socket timeout  
-• Automatic 3× retry with 5-s back-off on Calendar API calls  
-• Detects midnight-to-midnight spans and sends them as true all-day events
+safe_sync.py – Outlook ➜ Google Calendar one-way sync
+- Explicit timeZone on dateTime events
+- Minimal RRULE sanitizer for Google
+- Python 3.9 compatible type hints
 """
-import os, json, time, socket, hashlib, datetime
+import os, json, time, socket, hashlib, datetime, re
 from collections import deque
+from typing import Optional
+from zoneinfo import ZoneInfo
 
-# ───────────────────── socket hard-timeout ───────────────────────────────
 socket.setdefaulttimeout(60)
 
 def retry(fn, *a, **kw):
-    """Run fn() with retries on socket timeout or 403/429 Google rate-limits."""
     for attempt in range(3):
         try:
             return fn(*a, **kw)
@@ -27,18 +26,25 @@ def retry(fn, *a, **kw):
             else:
                 raise
 
-# ───────────────────── Google auth / build ───────────────────────────────
-from google.oauth2.credentials  import Credentials
-from google_auth_oauthlib.flow  import InstalledAppFlow
-from googleapiclient.discovery  import build
-from googleapiclient.errors     import HttpError
-from google.auth.transport.requests import Request
-
+# ── Config ────────────────────────────────────────────────────────────────
 BASE   = os.path.expanduser('~/calendarBridge')
 TOKEN  = f"{BASE}/token.json"
 CREDS  = f"{BASE}/credentials.json"
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 CAL_ID = 'primary'
+DEFAULT_TZ_NAME = os.environ.get('CALBRIDGE_TZ', 'America/New_York')
+try:
+    DEFAULT_TZ = ZoneInfo(DEFAULT_TZ_NAME)
+except Exception:
+    DEFAULT_TZ_NAME = 'UTC'
+    DEFAULT_TZ = ZoneInfo('UTC')
+
+# ── Google auth ───────────────────────────────────────────────────────────
+from google.oauth2.credentials  import Credentials
+from google_auth_oauthlib.flow  import InstalledAppFlow
+from googleapiclient.discovery  import build
+from googleapiclient.errors     import HttpError
+from google.auth.transport.requests import Request
 
 creds = None
 if os.path.exists(TOKEN):
@@ -53,7 +59,7 @@ if not creds or not creds.valid:
 
 service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
 
-# ───────────────────── read Outlook .ics files ───────────────────────────
+# ── Read Outlook .ics files ───────────────────────────────────────────────
 from icalendar import Calendar
 ICS_DIR = f"{BASE}/outbox"
 outlook = {}
@@ -67,20 +73,20 @@ for fn in os.listdir(ICS_DIR):
                 outlook[f"{uid}❄{rec}"] = ev
 print(f"📂 Parsed {len(outlook)} Outlook events")
 
-# Remove canceled recurring occurrences from outlook (so they will be deleted)
+# Drop explicitly-cancelled instances
 for key in list(outlook.keys()):
     comp = outlook[key]
     if str(comp.get('STATUS', '')).upper() == 'CANCELLED':
         outlook.pop(key, None)
 
-# ───────────────────── pull Google events we manage ──────────────────────
+# ── Load Google events we manage ──────────────────────────────────────────
 google, page = {}, None
 while True:
     resp = retry(service.events().list,
                  calendarId=CAL_ID,
                  pageToken=page,
                  maxResults=2500,
-                 fields=('nextPageToken, items(id,summary,description,start,end,extendedProperties)')).execute()
+                 fields='nextPageToken,items(id,summary,description,start,end,extendedProperties)').execute()
     for it in resp.get('items', []):
         key = it.get('extendedProperties', {}).get('private', {}).get('compositeUID')
         if key:
@@ -90,28 +96,83 @@ while True:
         break
 print(f"☁️  Loaded {len(google)} Google events tagged as Outlook-origin")
 
-# ───────────────────── helpers ───────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────
+def ensure_tz(dt: datetime.datetime) -> datetime.datetime:
+    if isinstance(dt, datetime.datetime) and (dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None):
+        return dt.replace(tzinfo=DEFAULT_TZ)
+    return dt
+
 def to_gcal_dt(dt):
-    return {'dateTime': dt.astimezone().isoformat()} if isinstance(dt, datetime.datetime) else {'date': dt.isoformat()}
+    if isinstance(dt, datetime.datetime):
+        dt = ensure_tz(dt)
+        return {'dateTime': dt.isoformat(), 'timeZone': DEFAULT_TZ_NAME}
+    else:
+        return {'date': dt.isoformat()}
 
 def body_hash(b):
     return hashlib.sha256(json.dumps(b, sort_keys=True).encode()).hexdigest()
 
 def maybe_all_day(start, end):
-    '''If span is midnight-to-midnight whole-days, return (d1,d2) else None.'''
     if isinstance(start, datetime.datetime) and isinstance(end, datetime.datetime):
+        start = ensure_tz(start); end = ensure_tz(end)
         if start.time() == end.time() == datetime.time(0, 0) and (end - start).seconds == 0:
             return start.date(), end.date()
     return None
+
+# Minimal RRULE sanitizer for Google
+_ALLOWED_KEYS = {"FREQ","INTERVAL","BYDAY","BYMONTHDAY","BYMONTH","COUNT","UNTIL","WKST","BYSETPOS","BYHOUR","BYMINUTE","BYSECOND","BYWEEKNO","BYYEARDAY"}
+_DT_RE   = re.compile(r'^\d{8}T\d{6}$')
+_DT_Z_RE = re.compile(r'^\d{8}T\d{6}Z$')
+_DATE_RE = re.compile(r'^\d{8}$')
+
+def sanitize_rrule(rrule_prop) -> Optional[str]:
+    if not rrule_prop:
+        return None
+    r = rrule_prop.to_ical().decode() if hasattr(rrule_prop, 'to_ical') else str(rrule_prop)
+    r = r.replace('\r','').replace('\n','').strip()
+    if r.upper().startswith('RRULE:'):
+        r = r[6:]
+    parts = [p for p in r.split(';') if p and '=' in p]
+    out = []
+    for p in parts:
+        k, v = p.split('=', 1)
+        kU = k.strip().upper()
+        vU = v.strip().upper()
+        if kU not in _ALLOWED_KEYS:
+            continue
+        if kU == "COUNT":
+            if not vU.isdigit() or int(vU) < 1:
+                continue
+        if kU == "INTERVAL":
+            try:
+                if int(vU) < 1:
+                    continue
+            except:
+                continue
+        if kU == "UNTIL":
+            if _DATE_RE.fullmatch(vU):
+                pass
+            elif _DT_Z_RE.fullmatch(vU):
+                pass
+            elif _DT_RE.fullmatch(vU):
+                vU = vU + "Z"
+            else:
+                continue
+        if kU == "BYDAY" and vU == "":
+            continue
+        out.append(f"{kU}={vU}")
+    if not any(x.startswith("FREQ=") for x in out):
+        return None
+    return "RRULE:" + ";".join(out)
 
 DELETE_BATCH = 50
 QUAR_FILE    = f"{BASE}/quarantine.txt"
 quarantined  = set(open(QUAR_FILE).read().split()) if os.path.exists(QUAR_FILE) else set()
 
-# ───────────────────── add / update phase ────────────────────────────────
+# ── Add / Update ──────────────────────────────────────────────────────────
 added = updated = skipped = 0
 
-# Group events by base UID (to handle recurring events with exceptions)
+# Group by base UID to handle recurring with exceptions
 grouped = {}
 for comp_key, comp in outlook.items():
     base_uid = comp_key.split('❄')[0]
@@ -120,13 +181,10 @@ for comp_key, comp in outlook.items():
 for base_uid, comp_keys in grouped.items():
     base_comp_key = base_uid + '❄'
     base_comp = outlook.get(base_comp_key)
-    if base_comp is None:
-        continue
-    if base_uid in quarantined:
+    if base_comp is None or base_uid in quarantined:
         continue
 
     if base_comp.get('RRULE'):
-        # Recurring event with possible exceptions
         s = base_comp['DTSTART'].dt
         e = base_comp.get('DTEND', base_comp['DTSTART']).dt
         ad = maybe_all_day(s, e)
@@ -137,6 +195,7 @@ for base_uid, comp_keys in grouped.items():
             if isinstance(s, datetime.date) and not isinstance(s, datetime.datetime):
                 e = e if isinstance(e, datetime.date) else s + datetime.timedelta(days=1)
             g_start, g_end = to_gcal_dt(s), to_gcal_dt(e)
+
         body = {
             'summary':  str(base_comp.get('SUMMARY', 'No title')),
             'location': str(base_comp.get('LOCATION', '')),
@@ -144,54 +203,22 @@ for base_uid, comp_keys in grouped.items():
             'end':      g_end,
             'extendedProperties': {'private': {'compositeUID': base_comp_key}}
         }
-        # Build recurrence rules/exceptions
+
         recurrences = []
-        rrule_prop = base_comp.get('RRULE')
-        if rrule_prop:
-            rrule_str = rrule_prop.to_ical().decode() if hasattr(rrule_prop, 'to_ical') else str(rrule_prop)
-            rrule_str = rrule_str.strip()
-            if not rrule_str.upper().startswith('RRULE'):
-                rrule_str = 'RRULE:' + rrule_str
+        rrule_str = sanitize_rrule(base_comp.get('RRULE'))
+        if rrule_str:
             recurrences.append(rrule_str)
-        if base_comp.get('RDATE'):
-            rdate_prop = base_comp.get('RDATE')
-            rdate_str = rdate_prop.to_ical().decode() if hasattr(rdate_prop, 'to_ical') else str(rdate_prop)
-            for ln in rdate_str.splitlines():
-                ln = ln.strip()
-                if not ln:
-                    continue
-                if not ln.upper().startswith('RDATE'):
-                    ln = 'RDATE:' + ln
-                recurrences.append(ln)
-        if base_comp.get('EXDATE'):
-            exdate_prop = base_comp.get('EXDATE')
-            exdate_str = exdate_prop.to_ical().decode() if hasattr(exdate_prop, 'to_ical') else str(exdate_prop)
-            for ln in exdate_str.splitlines():
-                ln = ln.strip()
-                if not ln:
-                    continue
-                if not ln.upper().startswith('EXDATE'):
-                    ln = 'EXDATE:' + ln
-                recurrences.append(ln)
-        # Include exceptions (for exclusions and overrides)
+        if recurrences:
+            body['recurrence'] = recurrences
+
+        # handle modified occurrences as independent events
         for comp_key in comp_keys:
             if comp_key == base_comp_key:
                 continue
             exc_comp = outlook[comp_key]
-            recurid_prop = exc_comp.get('RECURRENCE-ID')
-            if recurid_prop:
-                recurid_value = recurid_prop.to_ical().decode().strip() if hasattr(recurid_prop, 'to_ical') else str(recurid_prop)
-                exdate_line = 'EXDATE'
-                for param, val in recurid_prop.params.items():
-                    exdate_line += f';{param}={val}'
-                exdate_line += ':' + recurid_value
-                if exdate_line not in recurrences:
-                    recurrences.append(exdate_line)
             status = str(exc_comp.get('STATUS', ''))
             if status.upper() == 'CANCELLED':
-                # No separate event for cancelled occurrence (just excluded above)
                 continue
-            # Add modified occurrence as separate event
             s_exc = exc_comp['DTSTART'].dt
             e_exc = exc_comp.get('DTEND', exc_comp['DTSTART']).dt
             ad_exc = maybe_all_day(s_exc, e_exc)
@@ -219,8 +246,7 @@ for base_uid, comp_keys in grouped.items():
                 updated += 1
             else:
                 skipped += 1
-        if recurrences:
-            body['recurrence'] = recurrences
+
         body['description'] = body_hash(body)
         g_evt_base = google.get(base_comp_key)
         if not g_evt_base:
@@ -231,8 +257,8 @@ for base_uid, comp_keys in grouped.items():
             updated += 1
         else:
             skipped += 1
+
     else:
-        # Single (non-recurring) event
         comp = base_comp
         s = comp['DTSTART'].dt
         e = comp.get('DTEND', comp['DTSTART']).dt
@@ -262,11 +288,11 @@ for base_uid, comp_keys in grouped.items():
         else:
             skipped += 1
 
-# ───────────────────── delete missing / quarantined ──────────────────────
+# ── Delete missing / quarantined ──────────────────────────────────────────
 queue = deque([(u, g['id']) for u, g in google.items() if (u not in outlook) or (u.split('❄')[0] in quarantined)])
 deleted = failed = 0
 while queue:
-    for _ in range(min(DELETE_BATCH, len(queue))):
+    for _ in range(min(50, len(queue))):
         uid, eid = queue.popleft()
         try:
             retry(service.events().delete, calendarId=CAL_ID, eventId=eid).execute()
@@ -281,5 +307,4 @@ while queue:
     if queue:
         time.sleep(2)
 
-# ───────────────────── summary ───────────────────────────────────────────
 print(f"\nSync complete: ➕{added} 🔄{updated} ⏭{skipped} ❌{deleted} ⚠️failed:{failed}")

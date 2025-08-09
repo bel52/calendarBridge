@@ -15,5 +15,5 @@ for ics in OUTBOX.glob("*.ics"):
     ics.write_text("\n".join(cleaned))
     count += 1
 
-print(f"🧽 Cleaned {count} ICS files")
+print(f"Cleaned {count} ICS files")
 sys.exit(0)
