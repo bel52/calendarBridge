@@ -1,28 +1,21 @@
-# Existing rules
-Python/
-backups/
-create/
-private/
-*.bak
-*.sh~
-*.log
-.DS_Store
-
-# New exclusions for cleanup and runtime files
-delete_all_outlook_events.py
-clean_orphans.py
-remove_calendar_duplicates.py
-remove_synced_duplicates.py
-reset_calendar.sh
-test_calendar.sh
-
-# Runtime-generated files and directories
-token.json
-sync_state.json
-synced_events.json
-logs/
-outbox/
-archive/
+# Python / venv
+.venv/
 __pycache__/
 *.pyc
-*.tmp
+
+# Runtime/output
+logs/
+outbox/
+inbox/
+reports/
+archive/
+*.log
+quarantine.txt
+
+# Credentials
+credentials.json
+token.json
+
+# Misc
+.DS_Store
+calendarBridge_backup_*.tar.gz
