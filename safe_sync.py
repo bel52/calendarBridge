@@ -2,11 +2,12 @@
 """
 safe_sync.py – Outlook ➜ Google Calendar one-way sync
 - Explicit timeZone on dateTime events
-- Minimal RRULE sanitizer for Google
-- Python 3.9 compatible type hints
+- RRULE sanitizer for Google
+- EXDATEs for modified & cancelled recurring instances (prevents duplicates)
+- Python 3.9 compatible
 """
 import os, json, time, socket, hashlib, datetime, re
-from collections import deque
+from collections import deque, defaultdict
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -63,21 +64,28 @@ service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
 from icalendar import Calendar
 ICS_DIR = f"{BASE}/outbox"
 outlook = {}
+all_components = []  # keep raw list for cancellation tracking
 for fn in os.listdir(ICS_DIR):
     if fn.endswith('.ics'):
         with open(f"{ICS_DIR}/{fn}", 'rb') as f:
             cal = Calendar.from_ical(f.read())
             for ev in cal.walk('VEVENT'):
+                all_components.append(ev)
                 uid = str(ev.get('UID'))
                 rec = str(ev.get('RECURRENCE-ID', ''))
                 outlook[f"{uid}❄{rec}"] = ev
 print(f"📂 Parsed {len(outlook)} Outlook events")
 
-# Drop explicitly-cancelled instances
-for key in list(outlook.keys()):
-    comp = outlook[key]
+# Track cancelled instances by base UID so we can add EXDATE (but don't create events)
+cancelled_by_base = defaultdict(list)
+for comp in list(outlook.values()):
     if str(comp.get('STATUS', '')).upper() == 'CANCELLED':
-        outlook.pop(key, None)
+        uid = str(comp.get('UID'))
+        rec_prop = comp.get('RECURRENCE-ID')
+        if rec_prop:
+            cancelled_by_base[uid].append(rec_prop)
+        # Remove so we won't try to create an event for it
+        outlook.pop(f"{uid}❄{str(rec_prop)}", None)
 
 # ── Load Google events we manage ──────────────────────────────────────────
 google, page = {}, None
@@ -165,6 +173,15 @@ def sanitize_rrule(rrule_prop) -> Optional[str]:
         return None
     return "RRULE:" + ";".join(out)
 
+def exdate_line_from_dt(dt) -> str:
+    """Build an EXDATE line in UTC (Z) or DATE for all-day."""
+    if isinstance(dt, datetime.datetime):
+        dt = ensure_tz(dt).astimezone(datetime.timezone.utc)
+        return "EXDATE:" + dt.strftime("%Y%m%dT%H%M%SZ")
+    else:
+        # all-day date
+        return "EXDATE:" + dt.strftime("%Y%m%d")
+
 DELETE_BATCH = 50
 QUAR_FILE    = f"{BASE}/quarantine.txt"
 quarantined  = set(open(QUAR_FILE).read().split()) if os.path.exists(QUAR_FILE) else set()
@@ -204,21 +221,36 @@ for base_uid, comp_keys in grouped.items():
             'extendedProperties': {'private': {'compositeUID': base_comp_key}}
         }
 
+        # Recurrence: RRULE + EXDATEs for modified & cancelled instances
         recurrences = []
         rrule_str = sanitize_rrule(base_comp.get('RRULE'))
         if rrule_str:
             recurrences.append(rrule_str)
-        if recurrences:
-            body['recurrence'] = recurrences
 
-        # handle modified occurrences as independent events
+        # EXDATE for CANCELLED instances
+        for rec_prop in cancelled_by_base.get(base_uid, []):
+            try:
+                dt = rec_prop.dt
+                recurrences.append(exdate_line_from_dt(dt))
+            except Exception:
+                pass
+
+        # Handle modified instances: add EXDATE for each, and create separate event
         for comp_key in comp_keys:
             if comp_key == base_comp_key:
                 continue
             exc_comp = outlook[comp_key]
+            rec_prop = exc_comp.get('RECURRENCE-ID')
+            if rec_prop:
+                try:
+                    recurrences.append(exdate_line_from_dt(rec_prop.dt))
+                except Exception:
+                    pass
+
             status = str(exc_comp.get('STATUS', ''))
             if status.upper() == 'CANCELLED':
-                continue
+                continue  # already excluded via EXDATE above
+
             s_exc = exc_comp['DTSTART'].dt
             e_exc = exc_comp.get('DTEND', exc_comp['DTSTART']).dt
             ad_exc = maybe_all_day(s_exc, e_exc)
@@ -246,6 +278,9 @@ for base_uid, comp_keys in grouped.items():
                 updated += 1
             else:
                 skipped += 1
+
+        if recurrences:
+            body['recurrence'] = recurrences
 
         body['description'] = body_hash(body)
         g_evt_base = google.get(base_comp_key)
@@ -307,4 +342,4 @@ while queue:
     if queue:
         time.sleep(2)
 
-print(f"\nSync complete: ➕{added} 🔄{updated} ⏭{skipped} ❌{deleted} ⚠️failed:{failed}")
+print(f\"\\nSync complete: ➕{added} 🔄{updated} ⏭{skipped} ❌{deleted} ⚠️failed:{failed}\")
