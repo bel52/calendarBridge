@@ -1,10 +1,10 @@
 -- exportEvents.scpt – Outlook → ~/calendarBridge/outbox/ (.ics)
--- Minimal & robust: iterate events and filter by start time inline.
--- No Unicode operators, no 'whose' filters, no tmp vars like 'st'.
+-- Exports all recurring series (regardless of start date),
+-- and non-recurring events only if their start is within the window.
 
 on run
     -- ===== CONFIG =====
-    set targetCalIndex to 2 -- change if needed (your list shows: 1|Calendar, 2|Calendar, 3|Birthdays)
+    set targetCalIndex to 2 -- adjust if needed
     set exportDaysBack to 60
     set exportDaysAhead to 120
     -- ===================
@@ -15,11 +15,10 @@ on run
     set quarantineFile to POSIX path of ((path to home folder as text) & "calendarBridge:quarantine.txt")
 
     do shell script "mkdir -p " & quoted form of posixOutbox
-    -- wildcard must live outside quotes:
-    do shell script "rm -f " & quoted form of posixOutbox & "*.ics"
+    do shell script "rm -f " & quoted form of posixOutbox & "*.ics" -- wildcard outside quotes
     do shell script "touch " & quoted form of quarantineFile
 
-    -- Date window (define OUTSIDE tell; reference with 'my' inside)
+    -- Date window (outside tell; reference with 'my')
     set startDate to (current date) - (exportDaysBack * days)
     set endDate to (current date) + (exportDaysAhead * days)
 
@@ -33,7 +32,24 @@ on run
 
         repeat with ev in allEvents
             try
-                if ((start time of ev) is greater than or equal to my startDate) and ((start time of ev) is less than or equal to my endDate) then
+                -- detect recurrence
+                set isRecurring to false
+                try
+                    set r to recurrence of ev
+                    if r is not missing value then set isRecurring to true
+                end try
+
+                set shouldExport to false
+                if isRecurring then
+                    set shouldExport to true
+                else
+                    set st to start time of ev
+                    if (st is greater than or equal to my startDate) and (st is less than or equal to my endDate) then
+                        set shouldExport to true
+                    end if
+                end if
+
+                if shouldExport then
                     set uidStr to (id of ev) as string
                     set eventDetails to icalendar data of ev
 
