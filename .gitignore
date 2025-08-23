@@ -1,21 +1,15 @@
-# Python / venv
+# Python Virtual Environment
 .venv/
 __pycache__/
 *.pyc
 
-# Runtime/output
+# Runtime directories and logs
 logs/
 outbox/
-inbox/
-reports/
-archive/
-*.log
-quarantine.txt
 
-# Credentials
+# Credentials and secrets
 credentials.json
 token.json
 
-# Misc
+# macOS specific
 .DS_Store
-calendarBridge_backup_*.tar.gz
