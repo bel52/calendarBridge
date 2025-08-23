@@ -1,4 +1,6 @@
 google-api-python-client
+google-auth-httplib2
 google-auth-oauthlib
 icalendar
-urllib3<2
+pytz
+recurring-ical-events

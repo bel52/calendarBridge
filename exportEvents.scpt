@@ -1,60 +1,48 @@
--- exportEvents.scpt – Outlook → ~/calendarBridge/outbox/ (.ics)
--- Minimal & robust: iterate events and filter by start time inline.
--- No Unicode operators, no 'whose' filters, no tmp vars like 'st'.
+-- ============================================================================
+-- AppleScript to Trigger a Bulk Export of a Named Outlook Calendar by Index
+-- Version: 9.0 (Handles duplicate names)
+-- ============================================================================
 
-on run
-    -- ===== CONFIG =====
-    set targetCalIndex to 2 -- change if needed (your list shows: 1|Calendar, 2|Calendar, 3|Birthdays)
-    set exportDaysBack to 60
-    set exportDaysAhead to 120
-    -- ===================
+on run argv
+    if (count of argv) < 2 then
+        error "Expected 2 arguments: calendar name and index."
+    end if
+    set calendarNameToFind to item 1 of argv
+    set calendarIndexToUse to (item 2 of argv) as integer
 
-    -- Paths
-    set outboxFolder to (path to home folder as text) & "calendarBridge:outbox:"
-    set posixOutbox to POSIX path of outboxFolder
-    set quarantineFile to POSIX path of ((path to home folder as text) & "calendarBridge:quarantine.txt")
+    set exportFolder to (system attribute "HOME") & "/calendarBridge/outbox/"
+    set exportFile to "outlook_full_export.ics"
+    set exportPath to exportFolder & exportFile
 
-    do shell script "mkdir -p " & quoted form of posixOutbox
-    -- wildcard must live outside quotes:
-    do shell script "rm -f " & quoted form of posixOutbox & "*.ics"
-    do shell script "touch " & quoted form of quarantineFile
-
-    -- Date window (define OUTSIDE tell; reference with 'my' inside)
-    set startDate to (current date) - (exportDaysBack * days)
-    set endDate to (current date) + (exportDaysAhead * days)
+    do shell script "mkdir -p " & quoted form of exportFolder
+    do shell script "rm -f " & quoted form of exportPath
 
     tell application "Microsoft Outlook"
-        activate
-        set targetCal to calendar targetCalIndex
-        set allEvents to calendar events of targetCal
+        set foundCalendar to missing value
+        try
+            -- Find all calendars matching the name
+            set matchingCalendars to (every calendar whose name is calendarNameToFind)
+            
+            if (count of matchingCalendars) < calendarIndexToUse then
+                error "Found " & (count of matchingCalendars) & " calendar(s) named '" & calendarNameToFind & "', but you requested index " & calendarIndexToUse & "."
+            end if
+            
+            -- Select the calendar at the specified index
+            set foundCalendar to item calendarIndexToUse of matchingCalendars
+            
+        on error errNum
+            error "Could not find calendar '" & calendarNameToFind & "' at index " & calendarIndexToUse & ". Error: " & errNum
+        end try
 
-        set exportedCount to 0
-        set skippedCount to 0
-
-        repeat with ev in allEvents
+        if foundCalendar is not missing value then
             try
-                if ((start time of ev) is greater than or equal to my startDate) and ((start time of ev) is less than or equal to my endDate) then
-                    set uidStr to (id of ev) as string
-                    set eventDetails to icalendar data of ev
-
-                    set savePath to (my posixOutbox) & uidStr & ".ics"
-                    set fileRef to open for access (POSIX file savePath) with write permission
-                    set eof of fileRef to 0
-                    write eventDetails to fileRef
-                    close access fileRef
-
-                    set exportedCount to exportedCount + 1
-                    delay 0.05
-                end if
-            on error errm
-                try
-                    set uidStr to (id of ev) as string
-                    do shell script "echo " & quoted form of uidStr & " >> " & quoted form of (my quarantineFile)
-                    set skippedCount to skippedCount + 1
-                end try
+                save foundCalendar in (POSIX file exportPath)
+            on error errMsg number errNum
+                error "Outlook failed to save the calendar. Error (" & errNum & "): " & errMsg
             end try
-        end repeat
-
-        log "Exported " & exportedCount & " events, skipped " & skippedCount
+        else
+            error "Failed to get a reference to the calendar."
+        end if
     end tell
+    log "Successfully exported calendar '" & calendarNameToFind & "' (index " & calendarIndexToUse & ") to: " & exportPath
 end run
