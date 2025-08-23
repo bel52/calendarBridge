@@ -1,182 +1,87 @@
-# Mac Outlook ➜ Google Calendar (One‑Way) — v2.0
+# Mac Outlook → Google Calendar Sync (v3.7)
 
-Local, script‑only sync from **Microsoft Outlook for macOS (client)** to **Google Calendar**.
-**One‑way**: Outlook → Google. Runs hourly via `launchd`.
-
----
-
-## Features
-
-* **Export window:** defaults to **60 days back / 120 days ahead**
-* **AppleScript exporter** → writes `.ics` files to `outbox/`
-* **ICS cleaner** → strips Outlook‑specific `X-` headers
-* **Google sync (Python):**
-
-  * Inserts/updates/deletes to keep Google in step with Outlook
-  * Prevents duplicates using a private tag (`extendedProperties.private.compositeUID`)
-  * Computes a content hash to skip unchanged events (idempotent)
-  * Detects midnight‑to‑midnight spans and posts **true all‑day** events
-  * Adds a **timezone** to floating times so Google accepts them
-  * **Sanitizes RRULEs** that Google otherwise rejects
-* **Hourly automation** with logs in `logs/`
-
-> **Security:** `credentials.json`, `token.json`, `logs/`, and `outbox/` are **not** in git (see `.gitignore`). Everything runs locally on your Mac.
+This project provides a robust, one-way synchronization from a local Microsoft Outlook for macOS client to a Google Calendar. It runs automatically in the background on an hourly schedule using macOS's native `launchd` service.
 
 ---
 
-## Repository layout
+## Key Features
+
+- **Automated Hourly Sync:** Runs every hour via a `launchd` agent.
+- **Robust Event Handling:**
+    - Expands recurring events to ensure all instances are synced.
+    - Intelligently detects and converts Outlook's "timed" all-day events (e.g., "12a - 12a") into true, banner-style all-day events for proper display on Google Calendar and iOS.
+    - Creates, updates, and deletes events in Google Calendar to maintain a perfect mirror of the Outlook source.
+- **Intelligent & Resilient:**
+    - Generates its own stable, unique IDs for each event to prevent issues with incompatible Outlook UIDs.
+    - Handles intermittent Outlook `AppleEvent timed out` errors gracefully by succeeding on the next hourly run.
+    - Manages API rate limits with an automatic backoff mechanism.
+- **Safe & Private:** All authentication tokens and calendar data are stored and processed locally on your Mac.
+
+## Repository Layout
+
+The project has been simplified to a few core files:
 
 ```
 calendarBridge/
-├── exportEvents.scpt                       # Outlook → outbox/*.ics (AppleScript)
-├── clean_ics_files.py                      # removes X‑ headers from ICS
-├── safe_sync.py                            # one‑way sync to Google
-├── full_sync.sh                            # export → clean → sync + logging
-├── launchd/
-│   └── com.calendarBridge.full_sync.plist  # hourly at Minute=0
+├── calendar_config.json
+├── calendar_sync.py
+├── cleanup_synced_events.py
+├── exportEvents.scpt
 ├── requirements.txt
-├── .gitignore
-└── README.md
+├── sync.sh
+├── net.leathermans.calendarbridge.plist
+└── .gitignore
 ```
 
-> Helper (not tracked): `list_outlook_calendars.scpt` prints your Outlook calendars with index.
-
 ---
 
-## Requirements
+## Setup Instructions
 
-* macOS (Ventura or similar)
-* Microsoft Outlook (desktop app)
-* Python **3.9** (virtualenv at `~/calendarBridge/.venv`)
-* Google Calendar API OAuth: `credentials.json` (first run generates `token.json`)
-
-### Python packages
-
-`requirements.txt` pins:
-
-* `google-api-python-client`
-* `google-auth-oauthlib`
-* `icalendar`
-* `urllib3<2` (avoids LibreSSL warnings on macOS Python 3.9)
-
----
-
-## Installation
+### 1. Initial Setup
 
 ```bash
-cd ~/calendarBridge
+# Navigate to your project directory
+cd /Users/bel/calendarBridge
+
+# Create a Python virtual environment
 python3 -m venv .venv
+
+# Activate the environment
 source .venv/bin/activate
+
+# Install required packages
 pip install -r requirements.txt
-
-# Place Google OAuth files (NOT in git):
-#  - credentials.json
-#  - token.json (created on first sync)
 ```
 
----
+### 2. Google API Credentials
 
-## Select your Outlook calendar
+Ensure you have a `credentials.json` file from your Google Cloud Platform project placed in the `calendarBridge` directory. The first time you run the sync, it will open a browser window for you to authorize the application, which will create a `token.json` file.
 
-List calendars and note the index, then set `targetCalIndex` in `exportEvents.scpt`.
+### 3. Configuration
 
-**If you have the helper script:**
+Edit the `calendar_config.json` file to match your setup. The script will look for the Outlook calendar by its name and index.
+
+```json
+{
+    "outlook_calendar_name": "Calendar",
+    "outlook_calendar_index": 2,
+    "google_calendar_id": "your-email@gmail.com",
+    "sync_days_past": 90,
+    "sync_days_future": 120,
+    "api_delay_seconds": 0.1
+}
+```
+
+### 4. Automation with `launchd`
+
+To run the sync automatically every hour:
 
 ```bash
-osascript ~/calendarBridge/list_outlook_calendars.scpt
+# Move the service file to your user's LaunchAgents directory
+mv net.leathermans.calendarbridge.plist ~/Library/LaunchAgents/
+
+# Load and start the service
+launchctl load ~/Library/LaunchAgents/net.leathermans.calendarbridge.plist
 ```
 
-**One‑liner alternative:**
-
-```bash
-osascript -e 'tell app "Microsoft Outlook" to set o to {} & repeat with i from 1 to (count of calendars) by 1 \n set end of o to (i as text) & " | " & (name of calendar i as text) \n end repeat \n return o as text'
-```
-
-Edit `exportEvents.scpt` and set:
-
-* `targetCalIndex` → your chosen calendar index
-* `exportDaysBack = 60`, `exportDaysAhead = 120` (or adjust)
-
----
-
-## First manual run
-
-```bash
-cd ~/calendarBridge
-source .venv/bin/activate
-
-osascript exportEvents.scpt        # Step 1: export Outlook → outbox/*.ics
-python clean_ics_files.py          # Step 2: strip X‑ headers
-python safe_sync.py                # Step 3: sync to Google (opens OAuth on first run)
-```
-
-* Re‑running `safe_sync.py` should show mostly **skipped** (dedupe & hashing).
-* Check your Google Calendar for all‑day and recurring series correctness.
-
----
-
-## Hourly automation (launchd)
-
-```bash
-mkdir -p ~/Library/LaunchAgents ~/calendarBridge/logs
-cp launchd/com.calendarBridge.full_sync.plist ~/Library/LaunchAgents/
-
-# Reload the job cleanly
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.calendarBridge.full_sync.plist 2>/dev/null || true
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.calendarBridge.full_sync.plist
-launchctl kickstart -k gui/$(id -u)/com.calendarBridge.full_sync
-```
-
-* Runs **every hour on the hour** (`StartCalendarInterval` Minute = `0`).
-* Logs: `~/calendarBridge/logs/launchd.out` and `launchd.err`.
-
-**Verify next run**
-
-```bash
-tail -n 200 ~/calendarBridge/logs/launchd.out
-launchctl list | grep com.calendarBridge.full_sync || true
-```
-
----
-
-## Configuration
-
-* **Timezone for timed events:** set env var `CALBRIDGE_TZ` (default: `America/New_York`).
-
-  * For the LaunchAgent session:
-
-    ```bash
-    launchctl setenv CALBRIDGE_TZ America/Chicago
-    launchctl kickstart -k gui/$(id -u)/com.calendarBridge.full_sync
-    ```
-* **Google Calendar target:** edit `CAL_ID` in `safe_sync.py` (default `primary`).
-* **Export window:** edit `exportDaysBack` / `exportDaysAhead` in `exportEvents.scpt`.
-
----
-
-## How it avoids duplicates
-
-* Each Google event gets a private tag: `extendedProperties.private.compositeUID` derived from the Outlook `UID` (and `RECURRENCE-ID` for exceptions).
-* The sync computes a JSON hash of event content and stores it in the description; unchanged events are skipped, deleted ones are removed.
-
----
-
-## Troubleshooting
-
-* **AppleScript exporter error or wrong calendar** → verify `targetCalIndex` using the listing step above.
-* **Google 400 “Missing time zone”** → handled by `safe_sync.py`; set `CALBRIDGE_TZ` if you prefer a different zone.
-* **Google 400 “Invalid recurrence rule”** → Outlook RRULEs are sanitized before insert/update.
-* **SSL/urllib3 warnings** → `urllib3<2` pinned in `requirements.txt`.
-
----
-
-## Contributing / Branching
-
-* Work on a feature branch, then PR into `main`.
-* Version tag for this release: **`v2.0`**.
-
----
-
-## License
-
-Private/internal use until a license is added.
+You can monitor the logs to see the sync happen: `tail -f logs/calendar_sync.log`
