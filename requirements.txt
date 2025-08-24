@@ -1,6 +1,6 @@
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
-icalendar
-pytz
-recurring-ical-events
+google-api-python-client==2.100.0
+google-auth-httplib2==0.1.1
+google-auth-oauthlib==1.1.0
+icalendar==5.0.10
+pytz==2023.3.post1
+recurring-ical-events==2.1.0

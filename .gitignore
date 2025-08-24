@@ -6,6 +6,7 @@ __pycache__/
 # Runtime directories and logs
 logs/
 outbox/
+sync_state.json
 
 # Credentials and secrets
 credentials.json
