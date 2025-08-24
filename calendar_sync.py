@@ -15,6 +15,7 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import re
 
 # --- Configuration ---
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -24,8 +25,9 @@ CONFIG_FILE = os.path.join(APP_DIR, 'calendar_config.json')
 TOKEN_FILE = os.path.join(APP_DIR, 'token.json')
 CREDENTIALS_FILE = os.path.join(APP_DIR, 'credentials.json')
 LOG_FILE = os.path.join(APP_DIR, 'logs', 'calendar_sync.log')
+STATE_FILE = os.path.join(APP_DIR, 'sync_state.json')
+HEALTH_FILE = '/tmp/calendarbridge_health.json'
 SCOPES = ['https://www.googleapis.com/auth/calendar']
-TIMEZONE = "America/New_York"
 
 # --- Logger Setup ---
 def setup_logger():
@@ -46,13 +48,21 @@ logger = setup_logger()
 # --- Main Application Logic ---
 class CalendarSync:
     def __init__(self):
-        self.config = self.load_config()
+        with open(CONFIG_FILE, 'r') as f:
+            self.config = json.load(f)
         self.google_service = self.get_google_service()
-        self.tz = pytz.timezone(TIMEZONE)
-
-    def load_config(self):
-        """Loads the configuration from the JSON file."""
-        with open(CONFIG_FILE, 'r') as f: return json.load(f)
+        self.tz = pytz.timezone(self.config.get('timezone', 'America/New_York'))
+        
+        # Statistics tracking
+        self.events_created = 0
+        self.events_updated = 0
+        self.events_deleted = 0
+        self.errors_encountered = []
+        self.sync_start_time = None
+        self.sync_duration = 0
+        self.last_sync_success = False
+        self.last_sync_time = None
+        self.consecutive_failures = 0
 
     def get_google_service(self):
         """Authenticates with Google and returns a Calendar service object."""
@@ -73,6 +83,26 @@ class CalendarSync:
             with open(TOKEN_FILE, 'w') as token:
                 token.write(creds.to_json())
         return build('calendar', 'v3', credentials=creds)
+
+    def generate_uid(self, component):
+        """Generate a stable UID that includes all relevant event data."""
+        summary = str(component.get('summary', 'No Title'))
+        location = str(component.get('location', ''))
+        description = str(component.get('description', ''))[:100]  # First 100 chars
+        dtstart = component.get('dtstart').dt
+        
+        # Determine if all-day event
+        is_all_day = not isinstance(dtstart, datetime.datetime)
+        if is_all_day:
+            uid_timestamp = dtstart.strftime('%Y%m%d')
+        else:
+            start_dt_for_uid = dtstart if dtstart.tzinfo else self.tz.localize(dtstart)
+            uid_timestamp = start_dt_for_uid.astimezone(pytz.utc).strftime('%Y%m%dT%H%M%SZ')
+        
+        # Include more fields in the signature for better change detection
+        event_signature = f"{summary}{location}{description}{uid_timestamp}".encode('utf-8')
+        hashed_signature = hashlib.sha256(event_signature).hexdigest()[:16]
+        return f"{hashed_signature}@cbridge.local"
 
     def execute_with_backoff(self, api_call):
         """Executes a Google API call with exponential backoff for retries."""
@@ -119,6 +149,7 @@ class CalendarSync:
             return True
         except subprocess.CalledProcessError as e:
             logger.error(f"AppleScript execution failed:\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
+            self.errors_encountered.append(f"AppleScript error: {e.stderr}")
             return False
 
     def get_existing_google_events(self, calendar_id, time_min, time_max):
@@ -139,6 +170,29 @@ class CalendarSync:
                 break
         logger.info(f"Found {len(all_events)} existing events in Google Calendar.")
         return all_events
+
+    def parse_ics_safely(self, ical_data):
+        """Parse ICS with better error handling."""
+        calendars = []
+        try:
+            # Try standard parsing first
+            cal = Calendar.from_ical(ical_data)
+            logger.info("Successfully parsed ICS using standard method")
+            return [cal]
+        except Exception as e:
+            logger.warning(f"Standard parsing failed: {e}, trying fallback method")
+            # Fallback to splitting method
+            sections = ical_data.split('BEGIN:VCALENDAR')
+            for i, section in enumerate(sections[1:], 1):  # Skip first empty element
+                try:
+                    cal_str = 'BEGIN:VCALENDAR' + section
+                    cal = Calendar.from_ical(cal_str)
+                    calendars.append(cal)
+                    logger.info(f"Successfully parsed calendar section {i}")
+                except Exception as e2:
+                    logger.error(f"Failed to parse section {i}: {e2}")
+                    self.errors_encountered.append(f"Parse error section {i}: {str(e2)[:100]}")
+        return calendars
 
     def build_event_body(self, component, uid):
         """Builds the Google Calendar event body from an ical component."""
@@ -165,9 +219,9 @@ class CalendarSync:
             end = {'date': end_date.strftime('%Y-%m-%d')}
         else:
             start_dt = dtstart if dtstart.tzinfo else self.tz.localize(dtstart)
-            end_dt = dtend if dtend.tzinfo else self.tz.localize(end_dt)
-            start = {'dateTime': start_dt.isoformat(), 'timeZone': TIMEZONE}
-            end = {'dateTime': end_dt.isoformat(), 'timeZone': TIMEZONE}
+            end_dt = dtend if dtend.tzinfo else self.tz.localize(dtend)
+            start = {'dateTime': start_dt.isoformat(), 'timeZone': self.config.get('timezone')}
+            end = {'dateTime': end_dt.isoformat(), 'timeZone': self.config.get('timezone')}
 
         event_body = {'summary': summary, 'start': start, 'end': end, 'iCalUID': uid}
         
@@ -182,12 +236,46 @@ class CalendarSync:
         
         return event_body
 
+    def sync_events_batch(self, events_to_process):
+        """Use Google Calendar batch API for better performance."""
+        if not events_to_process:
+            return
+        
+        batch = self.google_service.new_batch_http_request()
+        batch_count = 0
+        
+        for event_data in events_to_process:
+            if event_data['action'] == 'create':
+                batch.add(self.google_service.events().insert(
+                    calendarId=self.config['google_calendar_id'],
+                    body=event_data['body']
+                ))
+                batch_count += 1
+            elif event_data['action'] == 'update':
+                batch.add(self.google_service.events().update(
+                    calendarId=self.config['google_calendar_id'],
+                    eventId=event_data['id'],
+                    body=event_data['body']
+                ))
+                batch_count += 1
+            
+            # Execute batch when it reaches the configured size
+            if batch_count >= self.config.get('batch_size', 50):
+                logger.info(f"Executing batch of {batch_count} operations")
+                batch.execute()
+                batch = self.google_service.new_batch_http_request()
+                batch_count = 0
+        
+        # Execute remaining operations
+        if batch_count > 0:
+            logger.info(f"Executing final batch of {batch_count} operations")
+            batch.execute()
+
     def sync_events(self):
         """The core logic to parse the ICS file and sync events to Google Calendar."""
         target_calendar_id = self.config.get('google_calendar_id')
         days_past = self.config.get('sync_days_past', 90)
         days_future = self.config.get('sync_days_future', 120)
-        api_delay = self.config.get('api_delay_seconds', 0.1)
         
         now = self.tz.localize(datetime.datetime.now())
         time_min = now - datetime.timedelta(days=days_past)
@@ -221,27 +309,14 @@ class CalendarSync:
         existing_google_events = self.get_existing_google_events(target_calendar_id, time_min, time_max)
         outlook_uids_in_range = set()
         processed_uids_this_run = set()
+        batch_operations = []
 
         logger.info(f"Processing {len(all_expanded_events)} expanded event instances from the ICS file...")
         for component in all_expanded_events:
             try:
                 summary = str(component.get('summary', 'No Title'))
-                dtstart = component.get('dtstart').dt
-
-                # --- New, Definitive UID Generation ---
-                is_all_day = not isinstance(dtstart, datetime.datetime)
-                if is_all_day:
-                    uid_timestamp = dtstart.strftime('%Y%m%d')
-                else:
-                    start_dt_for_uid = dtstart if dtstart.tzinfo else self.tz.localize(dtstart)
-                    uid_timestamp = start_dt_for_uid.astimezone(pytz.utc).strftime('%Y%m%dT%H%M%SZ')
                 
-                # Create a unique, stable fingerprint for the event instance.
-                event_signature = f"{summary}{uid_timestamp}".encode('utf-8')
-                hashed_signature = hashlib.sha1(event_signature).hexdigest()
-                uid = f"{hashed_signature}@cbridge.local"
-                # --- End of New UID Generation ---
-
+                uid = self.generate_uid(component)
                 outlook_uids_in_range.add(uid)
 
                 if uid in processed_uids_this_run:
@@ -250,49 +325,38 @@ class CalendarSync:
                 new_event_body = self.build_event_body(component, uid)
 
                 if uid not in existing_google_events:
-                    logger.info(f"CREATING event: '{summary}'")
-                    api_request = self.google_service.events().insert(calendarId=target_calendar_id, body=new_event_body)
-                    self.execute_with_backoff(api_request)
-                    time.sleep(api_delay)
+                    batch_operations.append({'action': 'create', 'body': new_event_body})
                 else:
                     existing_event = existing_google_events[uid]
                     is_changed = False
-                    # Only need to compare summary now as other fields are part of the UID
-                    if new_event_body.get('summary', '') != existing_event.get('summary', ''):
-                        is_changed = True
+                    for key in ['summary', 'location', 'description']:
+                        if new_event_body.get(key, '') != existing_event.get(key, ''):
+                            is_changed = True
+                            break
                     
                     if is_changed:
-                        logger.info(f"UPDATING event: '{summary}'")
                         event_id = existing_event['id']
-                        api_request = self.google_service.events().update(calendarId=target_calendar_id, eventId=event_id, body=new_event_body)
-                        self.execute_with_backoff(api_request)
-                        time.sleep(api_delay)
+                        batch_operations.append({
+                            'action': 'update', 
+                            'id': event_id, 
+                            'body': new_event_body
+                        })
                 
                 processed_uids_this_run.add(uid)
 
             except Exception as e:
                 logger.error(f"An unexpected error occurred while processing event '{component.get('summary', 'Unknown Event')}': {e}", exc_info=True)
         
-        google_uids_in_range = set(existing_google_events.keys())
-        orphan_uids = google_uids_in_range - outlook_uids_in_range
-
-        if orphan_uids:
-            logger.info(f"--- Deleting {len(orphan_uids)} Orphan Events ---")
-            for uid in orphan_uids:
-                event_to_delete = existing_google_events[uid]
-                summary = event_to_delete.get('summary', 'No Title')
-                event_id = event_to_delete['id']
-                logger.info(f"DELETING orphan event: {summary} (UID: {uid})")
-                api_request = self.google_service.events().delete(calendarId=target_calendar_id, eventId=event_id)
-                self.execute_with_backoff(api_request)
-                time.sleep(api_delay)
+        if batch_operations:
+            logger.info(f"Executing {len(batch_operations)} batch operations")
+            self.sync_events_batch(batch_operations)
         
         if os.path.exists(EXPORT_FILE):
             os.remove(EXPORT_FILE)
 
     def run(self):
         """Main execution flow for a single sync cycle."""
-        logger.info("--- Starting CalendarBridge Sync Cycle (v3.7 - Generated UIDs) ---")
+        logger.info("--- Starting CalendarBridge Sync Cycle (v3.8 - Batch Mode) ---")
         if self.run_applescript_export():
             wait_start_time = time.time()
             max_wait_seconds = 60
