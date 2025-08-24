@@ -1,87 +1,105 @@
-# Mac Outlook → Google Calendar Sync (v3.7)
+# CalendarBridge — v4.0.0 (Stable)
 
-This project provides a robust, one-way synchronization from a local Microsoft Outlook for macOS client to a Google Calendar. It runs automatically in the background on an hourly schedule using macOS's native `launchd` service.
+One‑way, local **Outlook (macOS client) → Google Calendar** sync that you fully control.  
+No Exchange Online admin visibility; runs locally via AppleScript + Python + Google Calendar API.
 
----
+## What’s new in v4
+- Stable iCalUIDs (uses Outlook UID when available + UTC instance start) → prevents duplicate/cancelled churn.
+- Accurate mirroring: add / update (summary, location, description) / delete orphans.
+- Optional Google **batch mode** for faster create/update/delete (reduced quota pressure).
+- Safer ICS parsing: strips problematic `X-` headers (e.g., `X-ENTOURAGE_UUID`) before parsing.
+- Robust exponential backoff & rotating logs.
 
-## Key Features
-
-- **Automated Hourly Sync:** Runs every hour via a `launchd` agent.
-- **Robust Event Handling:**
-    - Expands recurring events to ensure all instances are synced.
-    - Intelligently detects and converts Outlook's "timed" all-day events (e.g., "12a - 12a") into true, banner-style all-day events for proper display on Google Calendar and iOS.
-    - Creates, updates, and deletes events in Google Calendar to maintain a perfect mirror of the Outlook source.
-- **Intelligent & Resilient:**
-    - Generates its own stable, unique IDs for each event to prevent issues with incompatible Outlook UIDs.
-    - Handles intermittent Outlook `AppleEvent timed out` errors gracefully by succeeding on the next hourly run.
-    - Manages API rate limits with an automatic backoff mechanism.
-- **Safe & Private:** All authentication tokens and calendar data are stored and processed locally on your Mac.
-
-## Repository Layout
-
-The project has been simplified to a few core files:
-
-```
-calendarBridge/
-├── calendar_config.json
-├── calendar_sync.py
-├── cleanup_synced_events.py
-├── exportEvents.scpt
-├── requirements.txt
-├── sync.sh
-├── net.leathermans.calendarbridge.plist
-└── .gitignore
-```
+> Design: one‑way sync from Outlook to Google. If you move a meeting time in Outlook, a new UID is generated for that instance; the old Google instance is deleted and the new one is created.
 
 ---
 
-## Setup Instructions
+## Folder layout (standardized)
+$HOME/calendarBridge/
+├── .venv/ # Python venv (local only)
+├── outbox/ # AppleScript export target (.ics)
+├── logs/ # Logs
+├── exportEvents.scpt # AppleScript: export Outlook → ICS
+├── calendar_sync.py # Main sync logic (v4)
+├── sync.sh # Entry point used by launchd + manual runs
+├── calendar_config.json # Config (IDs, windows, batch on/off, TZ)
+├── VERSION # 4.0.0
+└── (credentials.json, token.json) # Google OAuth (kept local; gitignored)
 
-### 1. Initial Setup
+---
 
+## Requirements
+- macOS (Ventura or similar), AppleScript enabled
+- Python 3.9 (recommended venv at `$HOME/calendarBridge/.venv`)
+- Google API OAuth credentials saved locally as `credentials.json` (do **not** commit)
+- Python packages (pin in your requirements file):
+  - `google-api-python-client`, `google-auth`, `google-auth-oauthlib`
+  - `icalendar`, `recurring_ical_events`, `pytz`
+
+Create/activate venv & install:
 ```bash
-# Navigate to your project directory
-cd /Users/bel/calendarBridge
-
-# Create a Python virtual environment
+cd "$HOME/calendarBridge"
 python3 -m venv .venv
-
-# Activate the environment
 source .venv/bin/activate
-
-# Install required packages
 pip install -r requirements.txt
-```
-
-### 2. Google API Credentials
-
-Ensure you have a `credentials.json` file from your Google Cloud Platform project placed in the `calendarBridge` directory. The first time you run the sync, it will open a browser window for you to authorize the application, which will create a `token.json` file.
-
-### 3. Configuration
-
-Edit the `calendar_config.json` file to match your setup. The script will look for the Outlook calendar by its name and index.
-
-```json
+Configuration (calendar_config.json)
+Replace placeholders with your values; keep everything else as shown.
 {
-    "outlook_calendar_name": "Calendar",
-    "outlook_calendar_index": 2,
-    "google_calendar_id": "your-email@gmail.com",
-    "sync_days_past": 90,
-    "sync_days_future": 120,
-    "api_delay_seconds": 0.1
+  "google_calendar_id": "<YOUR_GOOGLE_CALENDAR_ID>",
+  "outlook_calendar_name": "<YOUR_OUTLOOK_CALENDAR_NAME>",
+  "outlook_calendar_index": 1,
+  "timezone": "America/New_York",
+  "sync_days_past": 90,
+  "sync_days_future": 120,
+
+  "enable_batch_operations": true,
+  "batch_size": 50,
+  "api_delay_seconds": 0.05
 }
-```
+Notes
+Updates are detected via summary, location, description.
+Time changes are handled via UID regeneration → old instance deleted, new created.
+Running manually
+cd "$HOME/calendarBridge"
+./sync.sh
+Watch logs:
+tail -n 200 "$HOME/calendarBridge/logs/calendar_sync.log"
+Hourly automation (launchd)
+Recommended LaunchAgent (at $HOME/Library/LaunchAgents/net.leathermans.calendarbridge.plist) runs at the top of every hour and at login:
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>net.leathermans.calendarbridge</string>
 
-### 4. Automation with `launchd`
+  <key>ProgramArguments</key>
+  <array><string>$HOME/calendarBridge/sync.sh</string></array>
 
-To run the sync automatically every hour:
+  <key>WorkingDirectory</key><string>$HOME/calendarBridge</string>
 
-```bash
-# Move the service file to your user's LaunchAgents directory
-mv net.leathermans.calendarbridge.plist ~/Library/LaunchAgents/
+  <!-- Run at the top of every hour -->
+  <key>StartCalendarInterval</key>
+  <dict><key>Minute</key><integer>0</integer></dict>
 
-# Load and start the service
-launchctl load ~/Library/LaunchAgents/net.leathermans.calendarbridge.plist
-```
+  <key>RunAtLoad</key><true/>
 
-You can monitor the logs to see the sync happen: `tail -f logs/calendar_sync.log`
+  <key>StandardOutPath</key><string>$HOME/calendarBridge/logs/launchd.out</string>
+  <key>StandardErrorPath</key><string>$HOME/calendarBridge/logs/launchd.err</string>
+</dict>
+</plist>
+Load / verify:
+launchctl bootout gui/$(id -u)/net.leathermans.calendarbridge 2>/dev/null || true
+launchctl load "$HOME/Library/LaunchAgents/net.leathermans.calendarbridge.plist"
+launchctl list | grep net.leathermans.calendarbridge
+Troubleshooting
+No events created: check logs/calendar_sync.log; confirm credentials.json/token.json exist locally.
+Frequent “Updating:” lines with no changes: ensure you’re on v4 (it no longer compares start/end for updates).
+Cancelled duplicates: typically unstable UIDs; v4 fixes this. Consider a one‑time cleanup of old cancelled artifacts.
+LibreSSL warning: harmless with macOS system Python; use venv + pinned deps.
+Security / privacy
+OAuth creds (credentials.json, token.json) are local only and gitignored.
+No server component; nothing visible to Exchange admins or any third party.
+Versioning
+VERSION file contains 4.0.0.
+Tag releases in Git (e.g., v4.0.0).

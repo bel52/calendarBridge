@@ -1,15 +1,31 @@
-# Python Virtual Environment
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
 
-# Runtime directories and logs
-logs/
+# macOS
+.DS_Store
+
+# Virtualenv
+.venv/
+
+# App data / runtime artifacts
 outbox/
+logs/
+*.log
 
-# Credentials and secrets
+# Google credentials/tokens (keep ONLY local)
 credentials.json
 token.json
 
-# macOS specific
-.DS_Store
+# Optional local state files (uncomment if you don't want them in git)
+# sync_state.json
+# synced_events.json
+
+# LaunchAgent logs (paths are set inside the plist)
+launchd.out
+launchd.err
