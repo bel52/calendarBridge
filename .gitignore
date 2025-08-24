@@ -29,3 +29,6 @@ token.json
 # LaunchAgent logs (paths are set inside the plist)
 launchd.out
 launchd.err
+
+# Local backups
+*.bak*
