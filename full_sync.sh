@@ -10,10 +10,9 @@ ts() { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "$(ts) $*"; }
 
 retry() {
-  # retry <max_tries> <sleep_seconds> -- <command...>
+  # retry <max_tries> <sleep_seconds> <command...>
   local tries="$1"; shift
   local sleep_s="$1"; shift
-  shift 0
   local n=1
   while true; do
     if "$@"; then
@@ -29,11 +28,11 @@ retry() {
 }
 
 check_connectivity() {
-  /usr/bin/curl -I -sS --max-time 5 https://oauth2.googleapis.com/generate_204 >/dev/null
+  /usr/bin/curl -I -sS --max-time 5 https://oauth2.googleapis.com/generate_204 >/dev/null || \
+  /usr/bin/curl -I -sS --max-time 5 https://www.google.com/generate_204 >/dev/null
 }
 
 run_export() {
-  # Always pass the correct calendar name + index
   osascript "$CB/exportEvents.scpt" "Calendar" 2
 }
 
@@ -48,16 +47,15 @@ run_sync() {
 {
   log "--- CalendarBridge full_sync.sh start ---"
 
-  log "Connectivity preflight to Google OAuth..."
-  if ! retry 3 10 -- check_connectivity; then
-    log "ERROR: No connectivity to oauth2.googleapis.com after retries; aborting this run."
-    log "--- full_sync.sh finished (failure) ---"
-    exit 1
+  log "Connectivity preflight to Google..."
+  if ! retry 3 10 check_connectivity; then
+    log "WARN: Connectivity check failed after retries; proceeding anyway."
+  else
+    log "Connectivity OK."
   fi
-  log "Connectivity OK."
 
   log "Exporting from Outlook (with retries)..."
-  if ! retry 3 10 -- run_export; then
+  if ! retry 3 10 run_export; then
     log "ERROR: AppleScript export failed after retries; aborting this run."
     log "--- full_sync.sh finished (failure) ---"
     exit 1
@@ -66,7 +64,7 @@ run_sync() {
   ls -lh "$OUTBOX" | tail -n +1
 
   log "Running calendar_sync.py (with retries)..."
-  if ! retry 3 10 -- run_sync; then
+  if ! retry 3 10 run_sync; then
     log "ERROR: calendar_sync.py failed after retries."
     log "--- full_sync.sh finished (failure) ---"
     exit 1
