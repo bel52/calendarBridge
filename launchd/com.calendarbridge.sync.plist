@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.calendarbridge.sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>$HOME/calendarBridge/full_sync.sh</string>
+  </array>
+
+  <!-- Run every hour -->
+  <key>StartInterval</key>
+  <integer>3600</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>${HOME}/calendarBridge/logs/launchd.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${HOME}/calendarBridge/logs/launchd.stderr.log</string>
+
+  <!-- Required for osascript to access Outlook in the GUI session -->
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+
+  <key>AbandonProcessGroup</key>
+  <true/>
+</dict>
+</plist>
