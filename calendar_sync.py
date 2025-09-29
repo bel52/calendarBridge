@@ -1,413 +1,314 @@
 #!/usr/bin/env python3
-import os, json, logging, datetime, subprocess, time, pytz, random, hashlib
-from logging.handlers import RotatingFileHandler
-from icalendar import Calendar
-import recurring_ical_events
+"""
+CalendarBridge: Outlook (ICS) -> Google Calendar (one-way)
+
+Key behaviors:
+- Parse ~/calendarBridge/outbox/outlook_full_export.ics
+- Supports files that contain multiple VCALENDAR sections (concatenated exports)
+- Expand recurring VEVENTs into instances (limited window)
+- Dedupe by ICS UID using extendedProperties.private.icalUID
+- Never set 'id' on insert (avoid 409 duplicate/conflict)
+- Maintain sync_state.json mapping { icalUID: google_event_id }
+- If mapping is missing, search by privateExtendedProperty
+- Respect date window (default: past 30d -> next 365d; configurable)
+- Verbose logging with --verbose
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Tuple, Optional
+
 from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.auth.transport.requests import Request
 
-class CalendarSync:
-    def __init__(self):
-        self.app_dir = os.path.dirname(os.path.realpath(__file__))
-        self.config_path = os.path.join(self.app_dir, 'calendar_config.json')
-        self.export_file = os.path.join(self.app_dir, 'outbox', 'outlook_full_export.ics')
-        self.token_file = os.path.join(self.app_dir, 'token.json')
-        self.credentials_file = os.path.join(self.app_dir, 'credentials.json')
-        self.log_file = os.path.join(self.app_dir, 'logs', 'calendar_sync.log')
-        self.config = self.load_config()
-        self.tz = pytz.timezone(self.config.get('timezone', 'America/New_York'))
-        self.enable_batch = bool(self.config.get('enable_batch_operations', False))
-        self.batch_size = int(self.config.get('batch_size', 50))
-        self.api_delay = float(self.config.get('api_delay_seconds', 0.1))
+import pytz
+from icalendar import Calendar
+import recurring_ical_events
 
-        self.logger = self.setup_logger()
-        self.google_service = self.get_google_service()
+ROOT = os.path.abspath(os.path.dirname(__file__))
+OUTBOX = os.path.join(ROOT, "outbox")
+ICS_PATH = os.path.join(OUTBOX, "outlook_full_export.ics")
+STATE_PATH = os.path.join(ROOT, "sync_state.json")
+CONFIG_PATH = os.path.join(ROOT, "calendar_config.json")
 
-    # ---------- infra ----------
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-    def setup_logger(self):
-        logger = logging.getLogger('CalendarBridge')
-        if logger.hasHandlers():
-            logger.handlers.clear()
-        logger.setLevel(logging.INFO)
-        os.makedirs(os.path.join(self.app_dir, 'logs'), exist_ok=True)
-        handler = RotatingFileHandler(self.log_file, maxBytes=5 * 1024 * 1024, backupCount=5)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.addHandler(logging.StreamHandler())
-        return logger
+DEFAULT_PAST_DAYS = 30
+DEFAULT_FUTURE_DAYS = 365
+BATCH_SIZE = 50
 
-    def load_config(self):
-        with open(self.config_path, 'r') as f:
+VCAL_RE = re.compile(br"BEGIN:VCALENDAR\r?\n.*?END:VCALENDAR\r?\n?", re.DOTALL)
+
+def log(msg: str, *, verbose: bool = True):
+    if verbose:
+        print(msg, flush=True)
+
+def load_config() -> Dict[str, Any]:
+    cfg = {
+        "target_calendar_id": "primary",
+        "tz": "America/New_York",
+        "past_days": DEFAULT_PAST_DAYS,
+        "future_days": DEFAULT_FUTURE_DAYS,
+    }
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            user = json.load(f)
+        cfg.update({k: v for k, v in user.items() if v is not None})
+    except FileNotFoundError:
+        pass
+    return cfg
+
+def get_service() -> Any:
+    cred_path = os.path.join(ROOT, "credentials.json")
+    token_path = os.path.join(ROOT, "token.json")
+    if not os.path.exists(cred_path):
+        raise FileNotFoundError(f"credentials.json not found at {cred_path}")
+
+    creds = None
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            raise RuntimeError("Missing/invalid token.json. Re-run to authorize.")
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+def load_state() -> Dict[str, str]:
+    try:
+        with open(STATE_PATH, "r") as f:
             return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
 
-    def get_google_service(self):
-        scopes = ['https://www.googleapis.com/auth/calendar']
-        creds = None
-        if os.path.exists(self.token_file):
-            creds = Credentials.from_authorized_user_file(self.token_file, scopes)
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                except Exception as e:
-                    self.logger.error(f'Error refreshing token: {e}. Re-authenticating.')
-                    flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, scopes)
-                    creds = flow.run_local_server(port=0)
+def save_state(state: Dict[str, str]):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, STATE_PATH)
+
+def read_calendars_from_bytes(data: bytes) -> List[Calendar]:
+    """
+    Return a list of icalendar.Calendar objects from raw bytes.
+    Handles concatenated VCALENDAR sections.
+    """
+    chunks = VCAL_RE.findall(data)
+    if chunks:
+        cals = []
+        for i, chunk in enumerate(chunks, 1):
+            try:
+                cals.append(Calendar.from_ical(chunk))
+            except Exception as e:
+                # Skip bad chunks but report
+                print(f"[WARN] Skipping VCALENDAR chunk #{i}: {e}", file=sys.stderr)
+        if cals:
+            return cals
+        # Fall through to single parse if none worked
+    # Single calendar case
+    return [Calendar.from_ical(data)]
+
+def parse_ics_instances(ics_path: str, tzname: str, past_days: int, future_days: int, verbose: bool) -> List[Dict[str, Any]]:
+    if not os.path.exists(ics_path):
+        raise FileNotFoundError(f"ICS export file not found at {ics_path}")
+
+    with open(ics_path, "rb") as f:
+        raw = f.read()
+
+    calendars = read_calendars_from_bytes(raw)
+
+    tz = pytz.timezone(tzname)
+    start = datetime.now(tz) - timedelta(days=past_days)
+    end = datetime.now(tz) + timedelta(days=future_days)
+
+    instances: List[Dict[str, Any]] = []
+    for cal in calendars:
+        # Expand recurrences within the window
+        events = recurring_ical_events.of(cal).between(start, end)
+        for e in events:
+            uid = str(e.get("UID"))
+            if not uid or uid.strip() == "":
+                continue
+
+            summary = str(e.get("SUMMARY") or "").strip()
+            description = str(e.get("DESCRIPTION") or "").strip()
+            location = str(e.get("LOCATION") or "").strip()
+
+            dtstart = e.get("DTSTART").dt
+            dtend = e.get("DTEND").dt if e.get("DTEND") else None
+
+            # Normalize to Google format
+            if hasattr(dtstart, "hour"):
+                if dtstart.tzinfo is None:
+                    dtstart = tz.localize(dtstart)
+                start_body = {"dateTime": dtstart.astimezone(timezone.utc).isoformat()}
             else:
-                flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, scopes)
-                creds = flow.run_local_server(port=0)
-            with open(self.token_file, 'w') as token:
-                token.write(creds.to_json())
-        return build('calendar', 'v3', credentials=creds)
+                start_body = {"date": dtstart.isoformat()}
 
-    # ---------- Outlook export ----------
+            if dtend is None:
+                if "dateTime" in start_body:
+                    end_dt = (datetime.fromisoformat(start_body["dateTime"].replace("Z", "+00:00")) + timedelta(hours=1)).isoformat()
+                    end_body = {"dateTime": end_dt}
+                else:
+                    end_body = {"date": start_body["date"]}
+            else:
+                if hasattr(dtend, "hour"):
+                    if dtend.tzinfo is None:
+                        dtend = tz.localize(dtend)
+                    end_body = {"dateTime": dtend.astimezone(timezone.utc).isoformat()}
+                else:
+                    end_body = {"date": dtend.isoformat()}
 
-    def run_applescript_export(self):
-        outlook_calendar_name = self.config.get('outlook_calendar_name')
-        outlook_calendar_index = self.config.get('outlook_calendar_index', 1)
-        if not outlook_calendar_name:
-            self.logger.error("outlook_calendar_name not set in config")
-            return False
-        script_path = os.path.join(self.app_dir, 'exportEvents.scpt')
-        os.makedirs(os.path.join(self.app_dir, 'outbox'), exist_ok=True)
-        self.logger.info("Triggering AppleScript for Outlook export...")
-        try:
-            subprocess.run(
-                ['osascript', script_path, outlook_calendar_name, str(outlook_calendar_index)],
-                check=True, capture_output=True, text=True
-            )
-            self.logger.info("AppleScript successfully triggered the export.")
-            return True
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"AppleScript execution failed:\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
-            return False
+            instances.append({
+                "uid": uid,
+                "summary": summary or "(no title)",
+                "description": description,
+                "location": location,
+                "start": start_body,
+                "end": end_body,
+            })
 
-    # ---------- ICS handling ----------
+    return instances
 
-    def clean_ics_data(self, ical_data: str) -> str:
-        cleaned = []
-        for line in ical_data.splitlines():
-            if line.startswith('X-ENTOURAGE_UUID') or line.startswith('X-CALENDARSERVER-') or line.startswith('X-MS-'):
-                continue
-            cleaned.append(line)
-        return "\n".join(cleaned)
+def find_by_private_uid(service, calendar_id: str, uid: str) -> Optional[Dict[str, Any]]:
+    try:
+        res = service.events().list(
+            calendarId=calendar_id,
+            privateExtendedProperty=f"icalUID={uid}",
+            maxResults=5,
+            singleEvents=False
+        ).execute()
+        items = res.get("items", [])
+        return items[0] if items else None
+    except HttpError:
+        return None
 
-    def parse_ics_file(self, path, time_min, time_max):
-        try:
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    ical_data = f.read()
-            except UnicodeDecodeError:
-                with open(path, 'r', encoding='latin-1') as f:
-                    ical_data = f.read()
-        except FileNotFoundError:
-            return []
-        if not ical_data.strip():
-            return []
-        ical_data = self.clean_ics_data(ical_data)
-
-        expanded_events = []
-        sections = ical_data.split('BEGIN:VCALENDAR')
-        for section in sections:
-            s = section.strip()
-            if not s:
-                continue
-            try:
-                cal = Calendar.from_ical('BEGIN:VCALENDAR' + section)
-                events = recurring_ical_events.of(cal).between(time_min, time_max)
-                expanded_events.extend(events)
-            except Exception as e:
-                self.logger.warning(f"Could not parse one VCALENDAR: {e}")
-        return expanded_events
-
-    # ---------- Google helpers ----------
-
-    def get_existing_google_events(self, calendar_id, time_min, time_max):
-        existing = {}
-        page_token = None
-        while True:
-            events_result = self.google_service.events().list(
-                calendarId=calendar_id,
-                timeMin=time_min.isoformat(),
-                timeMax=time_max.isoformat(),
-                singleEvents=True,
-                showDeleted=False,
-                maxResults=2500,
-                pageToken=page_token
-            ).execute()
-            for event in events_result.get('items', []):
-                if 'iCalUID' in event:
-                    existing[event['iCalUID']] = event
-            page_token = events_result.get('nextPageToken')
-            if not page_token:
-                break
-        return existing
-
-    def compute_uid(self, component):
-        summary = str(component.get('summary', 'No Title'))
-        dtstart = component.get('dtstart').dt
-        is_all_day = not isinstance(dtstart, datetime.datetime)
-        if is_all_day:
-            uid_ts = dtstart.strftime('%Y%m%d')
-        else:
-            start_dt = dtstart if dtstart.tzinfo else self.tz.localize(dtstart)
-            uid_ts = start_dt.astimezone(pytz.utc).strftime('%Y%m%dT%H%M%SZ')
-        try:
-            source_uid = str(component.get('uid')) or ''
-        except Exception:
-            source_uid = ''
-        base = source_uid if source_uid else summary
-        hashed = hashlib.sha1(f"{base}{uid_ts}".encode('utf-8')).hexdigest()
-        return f"{hashed}@cbridge.local"
-
-    def build_event_body(self, component, uid):
-        summary = str(component.get('summary', 'No Title'))
-        dtstart = component.get('dtstart').dt
-        dtend = component.get('dtend').dt
-
-        # All-day detection (standard all-day or 00:00 start with full-day multiple)
-        is_all_day = not isinstance(dtstart, datetime.datetime)
-        if not is_all_day and isinstance(dtstart, datetime.datetime):
-            starts_at_midnight = dtstart.time() == datetime.time(0, 0)
-            duration = dtend - dtstart
-            is_full_day_multiple = duration.total_seconds() > 0 and duration.total_seconds() % (24 * 3600) == 0
-            if starts_at_midnight and is_full_day_multiple:
-                is_all_day = True
-
-        if is_all_day:
-            start_date = dtstart if not isinstance(dtstart, datetime.datetime) else dtstart.date()
-            end_date = dtend if not isinstance(dtend, datetime.datetime) else dtend.date()
-            start = {'date': start_date.strftime('%Y-%m-%d')}
-            end = {'date': end_date.strftime('%Y-%m-%d')}
-        else:
-            start_dt = dtstart if dtstart.tzinfo else self.tz.localize(dtstart)
-            end_dt = dtend if dtend.tzinfo else self.tz.localize(dtend)
-            start = {'dateTime': start_dt.isoformat(), 'timeZone': self.tz.zone}
-            end = {'dateTime': end_dt.isoformat(), 'timeZone': self.tz.zone}
-
-        event_body = {
-            'summary': summary,
-            'start': start,
-            'end': end,
-            'iCalUID': uid
+def upsert_event(service, calendar_id: str, state: Dict[str, str], inst: Dict[str, Any], verbose: bool) -> Tuple[str, str]:
+    uid = inst["uid"]
+    body = {
+        "summary": inst["summary"],
+        "location": inst["location"] or None,
+        "description": inst["description"] or None,
+        "start": inst["start"],
+        "end": inst["end"],
+        "extendedProperties": {
+            "private": {
+                "icalUID": uid
+            }
         }
-        if component.get('location'):
-            event_body['location'] = str(component.get('location'))
-        if component.get('description'):
-            event_body['description'] = str(component.get('description'))
-        transp = component.get('transp')
-        if transp and str(transp) == 'TRANSPARENT':
-            event_body['transparency'] = 'transparent'
-        return event_body
+    }
 
-    # ---------- Sync core (now with optional batching) ----------
-
-    def sync_events(self):
-        calendar_id = self.config.get('google_calendar_id')
-        days_past = self.config.get('sync_days_past', 90)
-        days_future = self.config.get('sync_days_future', 120)
-
-        now = self.tz.localize(datetime.datetime.now())
-        time_min = now - datetime.timedelta(days=days_past)
-        time_max = now + datetime.timedelta(days=days_future)
-
-        if not os.path.exists(self.export_file):
-            self.logger.error(f"Export file not found at {self.export_file}. Aborting sync.")
-            return
-
-        expanded_events = self.parse_ics_file(self.export_file, time_min, time_max)
-        existing_google = self.get_existing_google_events(calendar_id, time_min, time_max)
-
-        # Build operation lists
-        to_create = []
-        to_update = []
-        outlook_uids = set()
-        processed_uids = set()
-
-        for component in expanded_events:
-            try:
-                uid = self.compute_uid(component)
-                outlook_uids.add(uid)
-                if uid in processed_uids:
-                    continue
-                body = self.build_event_body(component, uid)
-                if uid not in existing_google:
-                    to_create.append(('insert', body))
-                else:
-                    existing_event = existing_google[uid]
-                    changed = False
-                    for key in ('summary', 'location', 'description'):
-                        if body.get(key, '') != existing_event.get(key, ''):
-                            changed = True
-                            break
-                    if changed:
-                        to_update.append(('update', existing_event['id'], body))
-                processed_uids.add(uid)
-            except Exception as e:
-                self.logger.error(f"Unexpected error processing event '{component.get('summary','Unknown Event')}': {e}", exc_info=True)
-
-        # Orphans to delete
-        orphan_uids = set(existing_google.keys()) - outlook_uids
-        to_delete = []
-        for uid in orphan_uids:
-            ev = existing_google[uid]
-            to_delete.append(('delete', ev['id'], ev.get('summary', 'No Title')))
-
-        # Execute operations: batch if enabled, else one by one (old behavior)
-        if self.enable_batch:
-            self.logger.info(f"Batch mode ON. create={len(to_create)}, update={len(to_update)}, delete={len(to_delete)}")
-            self._run_batched(calendar_id, to_create, to_update, to_delete)
-        else:
-            self.logger.info(f"Batch mode OFF. create={len(to_create)}, update={len(to_update)}, delete={len(to_delete)}")
-            # one-by-one (preserves previous behavior)
-            for _, body in to_create:
-                self.logger.info(f"Creating: {body['summary']}")
-                req = self.google_service.events().insert(calendarId=calendar_id, body=body)
-                self._exec_with_backoff(req)
-                time.sleep(self.api_delay)
-            for _, event_id, body in to_update:
-                self.logger.info(f"Updating: {body['summary']}")
-                req = self.google_service.events().update(calendarId=calendar_id, eventId=event_id, body=body)
-                self._exec_with_backoff(req)
-                time.sleep(self.api_delay)
-            for _, event_id, summary in to_delete:
-                self.logger.info(f"Deleting orphan: {summary}")
-                req = self.google_service.events().delete(calendarId=calendar_id, eventId=event_id)
-                self._exec_with_backoff(req)
-                time.sleep(self.api_delay)
-
-        # Clean up export file
+    mapped_id = state.get(uid)
+    if mapped_id:
         try:
-            if os.path.exists(self.export_file):
-                os.remove(self.export_file)
-        except Exception:
-            pass
+            updated = service.events().patch(calendarId=calendar_id, eventId=mapped_id, body=body).execute()
+            return ("update", updated["id"])
+        except HttpError as e:
+            if e.resp.status not in (404, 410):
+                raise
 
-    # ---------- Batch helpers ----------
+    found = find_by_private_uid(service, calendar_id, uid)
+    if found:
+        try:
+            updated = service.events().patch(calendarId=calendar_id, eventId=found["id"], body=body).execute()
+            state[uid] = updated["id"]
+            return ("update", updated["id"])
+        except HttpError as e:
+            if e.resp.status not in (404, 410):
+                raise
 
-    def _run_batched(self, calendar_id, to_create, to_update, to_delete):
-        """
-        Use googleapiclient's batch to group operations.
-        Each batch sends up to self.batch_size requests; we run create, update, delete in that order.
-        Failures are logged per-item and do not stop the batch.
-        """
-        def run_batch_group(reqs):
-            # Build batch and execute
-            batch = self.google_service.new_batch_http_request()
-            for idx, (kind, payload) in enumerate(reqs):
-                def _callback(kind=kind, payload=payload):
-                    def cb(request_id, response, exception):
-                        if exception:
-                            # Log but continue
-                            if kind == 'insert':
-                                self.logger.error(f"[batch] Create FAILED: {payload.get('summary','(no summary)')} :: {exception}")
-                            elif kind == 'update':
-                                self.logger.error(f"[batch] Update FAILED: {payload.get('summary','(no summary)')} :: {exception}")
-                            elif kind == 'delete':
-                                self.logger.error(f"[batch] Delete FAILED: {payload} :: {exception}")
-                        else:
-                            # Optional success logging at debug level to keep output tidy
-                            pass
-                    return cb
+    created = service.events().insert(calendarId=calendar_id, body=body).execute()
+    state[uid] = created["id"]
+    return ("create", created["id"])
 
-                if kind == 'insert':
-                    req = self.google_service.events().insert(calendarId=calendar_id, body=payload)
-                elif kind == 'update':
-                    event_id, body = payload  # payload is tuple here
-                    req = self.google_service.events().update(calendarId=calendar_id, eventId=event_id, body=body)
-                elif kind == 'delete':
-                    event_id = payload
-                    req = self.google_service.events().delete(calendarId=calendar_id, eventId=event_id)
-                else:
-                    continue
+def current_index(service, calendar_id: str, verbose: bool) -> Dict[str, Dict[str, Any]]:
+    idx: Dict[str, Dict[str, Any]] = {}
+    page_token = None
+    while True:
+        res = service.events().list(
+            calendarId=calendar_id,
+            maxResults=2500,
+            pageToken=page_token,
+            singleEvents=False,
+            showDeleted=False,
+            privateExtendedProperty="icalUID"
+        ).execute()
+        for e in res.get("items", []):
+            priv = (e.get("extendedProperties") or {}).get("private") or {}
+            uid = priv.get("icalUID")
+            if uid:
+                idx[uid] = e
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return idx
 
-                batch.add(req, callback=_callback())
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--verbose", action="store_true", help="verbose logs")
+    ap.add_argument("--past-days", type=int, default=None)
+    ap.add_argument("--future-days", type=int, default=None)
+    args = ap.parse_args()
+    verbose = args.verbose
 
-            # Execute with top-level retry in case the whole batch fails transiently
-            self._exec_batch_with_backoff(batch)
+    cfg = load_config()
+    calendar_id = cfg.get("target_calendar_id", "primary")
+    tzname = cfg.get("tz", "America/New_York")
+    past_days = args.past_days if args.past_days is not None else int(cfg.get("past_days", DEFAULT_PAST_DAYS))
+    future_days = args.future_days if args.future_days is not None else int(cfg.get("future_days", DEFAULT_FUTURE_DAYS))
 
-        # Flatten payloads into a uniform list for batching: ('insert', body) -> ('insert', body)
-        # For updates/deletes we wrap to make callback logging simple.
-        create_payloads = [('insert', body) for _, body in to_create]
-        update_payloads = [('update', (event_id, body)) for _, event_id, body in to_update]
-        delete_payloads = [('delete', event_id) for _, event_id, _ in to_delete]
+    log("--- Starting CalendarBridge Sync Cycle ---", verbose=verbose)
+    log(f"Config: calendar_id={calendar_id} tz={tzname} window=[-{past_days}d,+{future_days}d]", verbose=verbose)
 
-        # Chunk and send
-        def chunks(arr, n):
-            for i in range(0, len(arr), n):
-                yield arr[i:i+n]
+    if not os.path.exists(ICS_PATH):
+        print(f"[ERR ] Export file not found: {ICS_PATH}", file=sys.stderr)
+        sys.exit(2)
 
-        for group_name, items in (('create', create_payloads), ('update', update_payloads), ('delete', delete_payloads)):
-            if not items:
-                continue
-            self.logger.info(f"Executing {group_name} in batches of {self.batch_size} (total {len(items)})")
-            for chunk in chunks(items, self.batch_size):
-                run_batch_group(chunk)
-                # Light delay between batches to be kind to quota
-                time.sleep(max(self.api_delay, 0.05))
+    service = get_service()
+    state = load_state()
 
-    def _exec_with_backoff(self, api_request):
-        max_retries = 5
-        for attempt in range(max_retries):
+    instances = parse_ics_instances(ICS_PATH, tzname, past_days, future_days, verbose)
+    log(f"Parsed {len(instances)} event instances from ICS window.", verbose=verbose)
+
+    creates = updates = 0
+    t0 = time.time()
+    for i, inst in enumerate(instances, start=1):
+        try:
+            action, eid = upsert_event(service, calendar_id, state, inst, verbose)
+            if action == "create":
+                creates += 1
+            else:
+                updates += 1
+        except HttpError as e:
+            reason = getattr(e, "reason", str(e))
+            print(f"[ERR ] Upsert failed for '{inst['summary']}' uid={inst['uid']}: {reason}", flush=True)
+        if i % BATCH_SIZE == 0:
+            log(f"[progress] processed {i}/{len(instances)}", verbose=verbose)
+    save_state(state)
+
+    current = current_index(service, calendar_id, verbose)
+    deletes = 0
+    desired_uids = {i["uid"] for i in instances}
+    for uid, ge in current.items():
+        if uid not in desired_uids:
             try:
-                return api_request.execute()
+                service.events().delete(calendarId=calendar_id, eventId=ge["id"]).execute()
+                deletes += 1
+                state.pop(uid, None)
             except HttpError as e:
-                status = e.resp.status
-                if status == 409:
-                    self.logger.warning("Conflict (likely duplicate). Ignoring.")
-                    return None
-                if status in [403, 500, 503]:
-                    if attempt < max_retries - 1:
-                        delay = (2 ** attempt) + random.uniform(0, 1)
-                        self.logger.warning(f"API rate limit/server error. Retrying in {delay:.2f}s...")
-                        time.sleep(delay)
-                    else:
-                        self.logger.error("Max retries exceeded.")
-                        raise
-                elif status in [404, 410]:
-                    self.logger.warning("Resource not found or already deleted.")
-                    return None
-                else:
-                    raise
+                if e.resp.status not in (404, 410):
+                    print(f"[WARN] Delete failed for uid={uid}: {e}", flush=True)
+    save_state(state)
 
-    def _exec_batch_with_backoff(self, batch):
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                batch.execute()
-                return
-            except HttpError as e:
-                status = e.resp.status if hasattr(e, 'resp') else None
-                if status in [403, 500, 503] and attempt < max_retries - 1:
-                    delay = (2 ** attempt) + random.uniform(0, 1)
-                    self.logger.warning(f"[batch] API rate limit/server error. Retrying batch in {delay:.2f}s...")
-                    time.sleep(delay)
-                else:
-                    # If the whole batch bombs out, log and move on;
-                    # per-item operations still survive in subsequent batches.
-                    self.logger.error(f"[batch] Batch failed irrecoverably: {e}")
-                    return
+    dt = time.time() - t0
+    log(f"Sync done: created={creates}, updated={updates}, deleted={deletes} in {dt:.1f}s", verbose=verbose)
 
-    # ---------- driver ----------
-
-    def run(self):
-        self.logger.info("--- Starting CalendarBridge Sync Cycle ---")
-        if self.run_applescript_export():
-            start_time = time.time()
-            max_wait = 60
-            while not os.path.exists(self.export_file):
-                time.sleep(1)
-                if time.time() - start_time > max_wait:
-                    self.logger.error(f"Timeout: export file not created within {max_wait} seconds.")
-                    return
-            self.logger.info("Export file found. Proceeding with sync.")
-            self.sync_events()
-        self.logger.info("--- Sync Cycle Finished ---")
-
-if __name__ == '__main__':
-    CalendarSync().run()
+if __name__ == "__main__":
+    main()
