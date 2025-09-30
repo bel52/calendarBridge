@@ -11,7 +11,7 @@ Key behaviors:
 - Maintain sync_state.json mapping { icalUID: google_event_id }
 - If mapping is missing, search by privateExtendedProperty
 - Respect date window (default: past 30d -> next 365d; configurable)
-- Verbose logging with --verbose
+- Backoff + jitter + steady throttle for Google API rate limits
 """
 import argparse
 import json
@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import time
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -41,7 +42,14 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 DEFAULT_PAST_DAYS = 30
 DEFAULT_FUTURE_DAYS = 365
-BATCH_SIZE = 50
+
+# How chatty we are with Google (base steady throttle + retry backoff on top)
+STEADY_THROTTLE_SECONDS = 0.25  # ~4 calls/sec max steady state (safe for per-minute caps)
+MAX_RETRIES = 8                 # retry budget per API call
+INITIAL_BACKOFF = 1.0           # seconds
+MAX_BACKOFF = 32.0              # cap a single sleep
+
+BATCH_PROGRESS_STEP = 50
 
 VCAL_RE = re.compile(br"BEGIN:VCALENDAR\r?\n.*?END:VCALENDAR\r?\n?", re.DOTALL)
 
@@ -107,11 +115,9 @@ def read_calendars_from_bytes(data: bytes) -> List[Calendar]:
             try:
                 cals.append(Calendar.from_ical(chunk))
             except Exception as e:
-                # Skip bad chunks but report
                 print(f"[WARN] Skipping VCALENDAR chunk #{i}: {e}", file=sys.stderr)
         if cals:
             return cals
-        # Fall through to single parse if none worked
     # Single calendar case
     return [Calendar.from_ical(data)]
 
@@ -130,7 +136,6 @@ def parse_ics_instances(ics_path: str, tzname: str, past_days: int, future_days:
 
     instances: List[Dict[str, Any]] = []
     for cal in calendars:
-        # Expand recurrences within the window
         events = recurring_ical_events.of(cal).between(start, end)
         for e in events:
             uid = str(e.get("UID"))
@@ -144,7 +149,6 @@ def parse_ics_instances(ics_path: str, tzname: str, past_days: int, future_days:
             dtstart = e.get("DTSTART").dt
             dtend = e.get("DTEND").dt if e.get("DTEND") else None
 
-            # Normalize to Google format
             if hasattr(dtstart, "hour"):
                 if dtstart.tzinfo is None:
                     dtstart = tz.localize(dtstart)
@@ -177,14 +181,82 @@ def parse_ics_instances(ics_path: str, tzname: str, past_days: int, future_days:
 
     return instances
 
-def find_by_private_uid(service, calendar_id: str, uid: str) -> Optional[Dict[str, Any]]:
+# --------------------
+# Google API helpers
+# --------------------
+_last_call_ts = 0.0
+
+def steady_throttle():
+    """Simple steady throttle to keep under per-minute caps."""
+    global _last_call_ts
+    now = time.time()
+    elapsed = now - _last_call_ts
+    if elapsed < STEADY_THROTTLE_SECONDS:
+        time.sleep(STEADY_THROTTLE_SECONDS - elapsed)
+    _last_call_ts = time.time()
+
+RETRYABLE_STATUS = {403, 429, 500, 502, 503, 504}
+
+def _retry_after_seconds(e: HttpError) -> Optional[float]:
     try:
-        res = service.events().list(
-            calendarId=calendar_id,
-            privateExtendedProperty=f"icalUID={uid}",
-            maxResults=5,
-            singleEvents=False
-        ).execute()
+        retry_after = e.resp.get('retry-after') or e.resp.get('Retry-After')
+        if retry_after:
+            return float(retry_after)
+    except Exception:
+        pass
+    return None
+
+def g_execute(request_callable, *, op_desc: str = "", verbose: bool = True):
+    """
+    Execute a googleapiclient request with:
+      - steady per-call throttle
+      - exponential backoff with jitter on rate/server errors
+      - honors Retry-After if present
+    request_callable: a zero-arg lambda returning request.execute()
+    """
+    steady_throttle()
+    delay = INITIAL_BACKOFF
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return request_callable()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            reason = getattr(e, "reason", str(e))
+            # Non-retryable
+            if status not in RETRYABLE_STATUS:
+                if verbose:
+                    print(f"[ERR ] {op_desc} failed (non-retryable {status}): {reason}", flush=True)
+                raise
+            # Retryable: compute sleep
+            ra = _retry_after_seconds(e)
+            sleep_for = ra if ra is not None else min(MAX_BACKOFF, delay * (1 + 0.25 * random.random()))
+            if verbose:
+                print(f"[rate] {op_desc} got {status}; sleeping {sleep_for:.1f}s (attempt {attempt}/{MAX_RETRIES})", flush=True)
+            time.sleep(sleep_for)
+            delay = min(MAX_BACKOFF, delay * 2)
+        except Exception as ex:
+            # Unknown error: one quick retry path then give up
+            if attempt >= 2:
+                if verbose:
+                    print(f"[ERR ] {op_desc} failed: {ex}", flush=True)
+                raise
+            time.sleep(1.0)
+    # If we fell out of loop, raise last HttpError again
+    raise RuntimeError(f"{op_desc} exhausted retries")
+
+def find_by_private_uid(service, calendar_id: str, uid: str, verbose: bool = True) -> Optional[Dict[str, Any]]:
+    """Search Google by our private extended property icalUID=<uid>."""
+    try:
+        res = g_execute(
+            lambda: service.events().list(
+                calendarId=calendar_id,
+                privateExtendedProperty=f"icalUID={uid}",
+                maxResults=5,
+                singleEvents=False
+            ).execute(),
+            op_desc=f"events.list privateExtendedProperty for uid={uid}",
+            verbose=verbose
+        )
         items = res.get("items", [])
         return items[0] if items else None
     except HttpError:
@@ -208,44 +280,73 @@ def upsert_event(service, calendar_id: str, state: Dict[str, str], inst: Dict[st
     mapped_id = state.get(uid)
     if mapped_id:
         try:
-            updated = service.events().patch(calendarId=calendar_id, eventId=mapped_id, body=body).execute()
+            updated = g_execute(
+                lambda: service.events().patch(calendarId=calendar_id, eventId=mapped_id, body=body).execute(),
+                op_desc=f"events.patch uid={uid}",
+                verbose=verbose
+            )
             return ("update", updated["id"])
         except HttpError as e:
             if e.resp.status not in (404, 410):
                 raise
+            # fall through if not found
 
-    found = find_by_private_uid(service, calendar_id, uid)
+    found = find_by_private_uid(service, calendar_id, uid, verbose=verbose)
     if found:
         try:
-            updated = service.events().patch(calendarId=calendar_id, eventId=found["id"], body=body).execute()
+            updated = g_execute(
+                lambda: service.events().patch(calendarId=calendar_id, eventId=found["id"], body=body).execute(),
+                op_desc=f"events.patch(found) uid={uid}",
+                verbose=verbose
+            )
             state[uid] = updated["id"]
             return ("update", updated["id"])
         except HttpError as e:
             if e.resp.status not in (404, 410):
                 raise
 
-    created = service.events().insert(calendarId=calendar_id, body=body).execute()
+    created = g_execute(
+        lambda: service.events().insert(calendarId=calendar_id, body=body).execute(),
+        op_desc=f"events.insert uid={uid}",
+        verbose=verbose
+    )
     state[uid] = created["id"]
     return ("create", created["id"])
 
-def current_index(service, calendar_id: str, verbose: bool) -> Dict[str, Dict[str, Any]]:
+def current_index(service, calendar_id: str, time_min: Optional[str], time_max: Optional[str], verbose: bool) -> Dict[str, Dict[str, Any]]:
+    """
+    Build a lightweight index of current Google events keyed by our private icalUID.
+    We fetch events within the same window and then pick those that actually
+    have extendedProperties.private.icalUID.
+    """
     idx: Dict[str, Dict[str, Any]] = {}
     page_token = None
+    page = 0
     while True:
-        res = service.events().list(
+        kwargs = dict(
             calendarId=calendar_id,
-            maxResults=2500,
+            maxResults=500,         # keep page small -> fewer per-call payloads, easier on quota
             pageToken=page_token,
             singleEvents=False,
             showDeleted=False,
-            privateExtendedProperty="icalUID"
-        ).execute()
+        )
+        if time_min:
+            kwargs["timeMin"] = time_min
+        if time_max:
+            kwargs["timeMax"] = time_max
+
+        res = g_execute(
+            lambda: service.events().list(**kwargs).execute(),
+            op_desc=f"events.list page={page}",
+            verbose=verbose
+        )
         for e in res.get("items", []):
             priv = (e.get("extendedProperties") or {}).get("private") or {}
             uid = priv.get("icalUID")
             if uid:
                 idx[uid] = e
         page_token = res.get("nextPageToken")
+        page += 1
         if not page_token:
             break
     return idx
@@ -274,9 +375,16 @@ def main():
     service = get_service()
     state = load_state()
 
+    # Parse ICS for desired instances
     instances = parse_ics_instances(ICS_PATH, tzname, past_days, future_days, verbose)
     log(f"Parsed {len(instances)} event instances from ICS window.", verbose=verbose)
 
+    # Compute the same window in RFC3339 UTC for Google list calls
+    tz = pytz.timezone(tzname)
+    g_time_min = (datetime.now(tz) - timedelta(days=past_days)).astimezone(timezone.utc).isoformat()
+    g_time_max = (datetime.now(tz) + timedelta(days=future_days)).astimezone(timezone.utc).isoformat()
+
+    # Create/update pass
     creates = updates = 0
     t0 = time.time()
     for i, inst in enumerate(instances, start=1):
@@ -287,24 +395,34 @@ def main():
             else:
                 updates += 1
         except HttpError as e:
+            # Already retried; log a concise line and keep going
             reason = getattr(e, "reason", str(e))
             print(f"[ERR ] Upsert failed for '{inst['summary']}' uid={inst['uid']}: {reason}", flush=True)
-        if i % BATCH_SIZE == 0:
+        if i % BATCH_PROGRESS_STEP == 0:
             log(f"[progress] processed {i}/{len(instances)}", verbose=verbose)
+            # light breather every chunk (helps minute-based caps)
+            time.sleep(1.0)
     save_state(state)
 
-    current = current_index(service, calendar_id, verbose)
+    # Delete pass: remove Google events (with our icalUID) that are no longer in the ICS window
+    current = current_index(service, calendar_id, g_time_min, g_time_max, verbose)
     deletes = 0
     desired_uids = {i["uid"] for i in instances}
-    for uid, ge in current.items():
+    for j, (uid, ge) in enumerate(current.items(), start=1):
         if uid not in desired_uids:
             try:
-                service.events().delete(calendarId=calendar_id, eventId=ge["id"]).execute()
+                g_execute(
+                    lambda: service.events().delete(calendarId=calendar_id, eventId=ge["id"]).execute(),
+                    op_desc=f"events.delete uid={uid}",
+                    verbose=verbose
+                )
                 deletes += 1
                 state.pop(uid, None)
             except HttpError as e:
                 if e.resp.status not in (404, 410):
                     print(f"[WARN] Delete failed for uid={uid}: {e}", flush=True)
+        if j % 100 == 0:
+            time.sleep(0.5)
     save_state(state)
 
     dt = time.time() - t0
