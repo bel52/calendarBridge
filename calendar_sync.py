@@ -24,15 +24,9 @@ log = logging.getLogger("calendar_sync")
 # =============================================================================
 def safe_event_id(uid: str) -> str:
     """Generate a Google-compliant deterministic event ID from UID."""
-    digest = hashlib.sha1(uid.encode("utf-8")).hexdigest()
-    base = re.sub(r"[^a-z0-9_-]", "-", uid.lower())
-    if not base or not base[0].isalpha():
-        base = "e" + base
-    base = re.sub(r"-+", "-", base).strip("-_")[:20]
-    event_id = f"{base}-{digest[:12]}"
-    if len(event_id) < 5:
-        event_id = f"e-{digest[:12]}"
-    return event_id[:64]
+    digest = hashlib.sha1(uid.encode("utf-8")).hexdigest()[:32]
+    event_id = f"e{digest}"
+    return event_id
 
 def _as_tz(dt: datetime, tzname: str) -> datetime:
     tz = gettz(tzname)
@@ -144,6 +138,10 @@ def sync_events(service, calendar_id: str, instances: List[Dict[str, Any]]):
     existing_index = {e.get("id"): e for e in existing_items}
     log.info(f"[INFO] Indexed {len(existing_index)} Google events in window")
 
+    created = 0
+    updated = 0
+    skipped = 0
+
     for inst in instances:
         event_id = safe_event_id(inst["uid"])
         body = {
@@ -153,8 +151,19 @@ def sync_events(service, calendar_id: str, instances: List[Dict[str, Any]]):
             "start": {"dateTime": inst["start"].isoformat()} if not inst["all_day"] else {"date": inst["start"].date().isoformat()},
             "end": {"dateTime": inst["end"].isoformat()} if not inst["all_day"] else {"date": inst["end"].date().isoformat()},
         }
+        
         try:
             if event_id in existing_index:
+                existing = existing_index[event_id]
+                # Compare - only patch if changed
+                if (existing.get("summary") == body["summary"] and
+                    existing.get("description") == body["description"] and
+                    existing.get("location") == body["location"] and
+                    existing.get("start") == body["start"] and
+                    existing.get("end") == body["end"]):
+                    skipped += 1
+                    continue
+                
                 gexec(
                     service.events().patch(
                         calendarId=calendar_id,
@@ -164,39 +173,66 @@ def sync_events(service, calendar_id: str, instances: List[Dict[str, Any]]):
                     verb_hint="events.patch",
                     uid_hint=inst["uid"],
                 )
+                updated += 1
                 continue
+            
             gexec(
                 service.events().insert(
                     calendarId=calendar_id,
-                    eventId=event_id,
-                    body=body,
+                    body={"id": event_id, **body},
                 ),
                 verb_hint="events.insert",
                 uid_hint=inst["uid"],
             )
+            created += 1
         except HttpError as e:
             if getattr(e, "resp", None) and e.resp.status == 404:
                 gexec(
                     service.events().insert(
                         calendarId=calendar_id,
-                        eventId=event_id,
-                        body=body,
+                        body={"id": event_id, **body},
                     ),
                     verb_hint="events.insert",
                     uid_hint=inst["uid"],
                 )
+                created += 1
+            elif getattr(e, "resp", None) and e.resp.status == 409:
+                gexec(
+                    service.events().patch(
+                        calendarId=calendar_id,
+                        eventId=event_id,
+                        body=body,
+                    ),
+                    verb_hint="events.patch",
+                    uid_hint=inst["uid"],
+                )
+                updated += 1
             else:
                 raise
+    
+    log.info(f"[DONE] Created: {created}, Updated: {updated}, Skipped: {skipped}")
 
 # =============================================================================
 # Entrypoint
 # =============================================================================
 def main():
     cfg = load_config()
-    calendar_id = cfg.get("calendar_id", "primary")
-    tzname = cfg.get("tz", "America/New_York")
+    calendar_id = cfg.get("google_calendar_id", "primary")
+    tzname = cfg.get("timezone", "America/New_York")
     start_window = datetime.now() - timedelta(days=30)
     end_window = datetime.now() + timedelta(days=365)
+
+    # Check if source changed since last sync
+    source_ics = "outbox/outlook_full_export.ics"
+    state_file = "last_sync_time.txt"
+    
+    if os.path.exists(state_file) and os.path.exists(source_ics):
+        with open(state_file) as f:
+            last_sync = float(f.read().strip())
+        
+        if os.path.getmtime(source_ics) < last_sync:
+            log.info("[SKIP] No changes to Outlook export since last sync")
+            sys.exit(0)
 
     outbox = os.path.join("outbox")
     ics_files = [os.path.join(outbox, f) for f in os.listdir(outbox) if f.startswith("clean_") and f.endswith(".ics")]
@@ -212,6 +248,10 @@ def main():
 
     service = get_service()
     sync_events(service, calendar_id, all_instances)
+    
+    # Mark successful sync
+    with open(state_file, 'w') as f:
+        f.write(str(time.time()))
 
 if __name__ == "__main__":
     main()
