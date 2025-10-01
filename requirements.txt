@@ -3,4 +3,4 @@ google-auth-httplib2
 google-auth-oauthlib
 icalendar
 pytz
-recurring-ical-events
+recurring-ical-events==3.6.2
