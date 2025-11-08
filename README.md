@@ -1,3 +1,178 @@
+# CalendarBridge (Outlook → Google Calendar)
+
+A resilient, hourly sync from Microsoft Outlook (macOS app export) to Google Calendar.
+Designed for reliability first, efficiency second. Handles recurring events correctly **within your chosen time window** (even if the series started outside the window). Prevents duplicates using a deterministic composite key.
+
+---
+
+## Contents
+- [Prereqs](#prereqs)
+- [Project layout](#project-layout)
+- [Virtualenv](#virtualenv)
+- [Configuration](#configuration)
+- [One-shot run](#one-shot-run)
+- [Hourly scheduling (launchd)](#hourly-scheduling-launchd)
+- [Logs](#logs)
+- [Git workflow](#git-workflow)
+- [Operational notes](#operational-notes)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Prereqs
+
+- macOS with the **Outlook** app installed and your target **Calendar** available.
+- Python **3.11+** (project has been tested with 3.14 venv).
+- Google API OAuth file at `calendarBridge/credentials.json` (already present).
+- First run will open a browser window to create `token.json` (stored alongside the script).
+
+## Project layout
+
+```
+calendarBridge/
+├── calendar_config.json        # sync window, timezone, target Google calendar
+├── credentials.json            # Google OAuth client secrets
+├── token.json                  # created on first run
+├── full_sync.sh                # export → clean → sync pipeline (activates venv)
+├── safe_sync.py                # main sync logic (no duplicates; idempotent)
+├── clean_ics_files.py          # splitting/cleaning helper (called from full_sync.sh)
+├── outbox/                     # .ics export and cleaned shards live here
+├── logs/                       # full_sync_*.log and launchd.out/err
+└── .venv/                      # Python virtual environment
+```
+
+## Virtualenv
+
+```bash
+cd ~/calendarBridge
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+## Configuration
+
+Edit `calendar_config.json`:
+
+```json
+{
+  "google_calendar_id": "brett@leathermans.net",
+  "timezone": "America/New_York",
+  "sync_days_past": 60,
+  "sync_days_future": 90,
+  "api_delay_seconds": 0.05
+}
+```
+
+- **sync_days_past / sync_days_future**: window of events to maintain on Google.
+- Recurring series that start outside the window are **still included** if any instance falls inside the window.
+- The sync is **stateful** via `sync_state.json` and will create/update/delete as needed.
+
+## One-shot run
+
+```bash
+cd ~/calendarBridge
+source .venv/bin/activate
+./full_sync.sh
+```
+
+On first run, you’ll be prompted to authorize Google Calendar access; `token.json` is saved for future runs.
+
+## Hourly scheduling (launchd)
+
+Create the LaunchAgent plist at `~/Library/LaunchAgents/net.leathermans.calendarbridge.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>net.leathermans.calendarbridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>/Users/bel/calendarBridge/full_sync.sh</string>
+    </array>
+
+    <!-- Ensure relative paths resolve (calendar_config.json, outbox/, logs/) -->
+    <key>WorkingDirectory</key>
+    <string>/Users/bel/calendarBridge</string>
+
+    <!-- Run every hour and also at login -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it ever crashes -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Capture logs -->
+    <key>StandardOutPath</key>
+    <string>/Users/bel/calendarBridge/logs/launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/bel/calendarBridge/logs/launchd.err</string>
+  </dict>
+</plist>
+```
+
+Load/refresh:
+
+```bash
+launchctl bootout gui/$(id -u)/net.leathermans.calendarbridge 2>/dev/null || true
+launchctl load "$HOME/Library/LaunchAgents/net.leathermans.calendarbridge.plist"
+launchctl kickstart -k gui/$(id -u)/net.leathermans.calendarbridge
+```
+
+> **Sleep behavior:** LaunchAgents don’t run while the Mac sleeps. They run promptly on wake. For mission‑critical always‑hourly execution, consider preventing sleep when on power or verifying a wake schedule in macOS Energy settings.
+
+## Logs
+
+```bash
+ls -lt ~/calendarBridge/logs | head -n 5
+tail -n 50 "$(ls -t ~/calendarBridge/logs/full_sync_*.log | head -n 1)"
+```
+
+- A new `full_sync_YYYY-MM-DD_HH-MM-SS.log` is written for each run.
+- `launchd.out` aggregates standard output and is helpful to confirm launchd is firing hourly.
+
+## Git workflow
+
+Authenticate once (stored in macOS Keychain), then you can use the simple trio forever:
+
+```bash
+cd ~/calendarBridge
+git add .
+git commit -m "Update"
+git push
+```
+
+If the remote changed meanwhile:
+
+```bash
+git pull --rebase
+git push
+```
+
+> Your PAT is stored in Keychain via `credential.helper=osxkeychain`. You will not need to paste it again for this repo on this Mac.
+
+## Operational notes
+
+- **Idempotent**: Running multiple times is safe; it creates, updates, or no‑ops.
+- **Duplicates**: Prevented via deterministic Google event IDs derived from `(UID|start)`.
+- **Deletes**: If an item leaves Outlook within the window, it’s removed from Google on the next run.
+- **Rate limits**: Backoff/retry is built in. On rare 403 bursts, it will retry and continue.
+
+## Troubleshooting
+
+- `FileNotFoundError: calendar_config.json`: Ensure the plist has `WorkingDirectory` set to `/Users/bel/calendarBridge` and the file exists there.
+- `403 rateLimitExceeded`: Temporary; the script auto‑backs off. If you see many, reduce parallelism (already very conservative) or adjust `api_delay_seconds` upward (e.g., 0.1).
+- Missing events: Confirm they appear in the latest `outbox/clean_*.ics` and fall inside the configured window. Recurring instances inside the window are included even if the series began earlier.
+- Duplicates after an earlier bug: Run `python cleanup_old_events.py` once, then re‑run `./full_sync.sh`.
 Updated CalendarBridge Guide
 Overview
 CalendarBridge is a local, one‑way synchronisation tool that exports events from an Outlook calendar on
