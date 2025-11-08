@@ -46,12 +46,12 @@ if [[ -f "${ROOT}/clean_ics_files.py" ]]; then
 fi
 
 echo "[STEP] 4/4 Run main sync"
-if [[ -f "${ROOT}/calendar_sync.py" ]]; then
-  python "${ROOT}/calendar_sync.py" --verbose || { echo "[ERR ] calendar_sync.py failed"; exit 30; }
-elif [[ -f "${ROOT}/safe_sync.py" ]]; then
-  python "${ROOT}/safe_sync.py" --verbose || { echo "[ERR ] safe_sync.py failed"; exit 31; }
+if [[ -f "${ROOT}/safe_sync.py" ]]; then
+  python "${ROOT}/safe_sync.py" --verbose || { echo "[ERR ] safe_sync.py failed"; exit 30; }
+elif [[ -f "${ROOT}/calendar_sync.py" ]]; then
+  python "${ROOT}/calendar_sync.py" --verbose || { echo "[ERR ] calendar_sync.py failed"; exit 31; }
 else
-  echo "[ERR ] No main sync script (calendar_sync.py or safe_sync.py) present"
+  echo "[ERR ] No main sync script present"
   exit 32
 fi
 
