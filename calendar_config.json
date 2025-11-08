@@ -1,13 +1,13 @@
 {
-    "outlook_calendar_name": "Calendar",
-    "outlook_calendar_index": 2,
-    "google_calendar_id": "brett@leathermans.net",
-    "sync_days_past": 60,
-    "sync_days_future": 90,
-    "api_delay_seconds": 0.05,
-    "timezone": "America/New_York",
-    "enable_batch_operations": true,
-    "batch_size": 50,
-    "enable_health_monitoring": true,
-    "enable_state_tracking": true
+  "outlook_calendar_name": "Calendar",
+  "outlook_calendar_index": 2,
+  "google_calendar_id": "brett@leathermans.net",
+  "sync_days_past": 60,
+  "sync_days_future": 90,
+  "api_delay_seconds": 1.05,
+  "timezone": "America/New_York",
+  "enable_batch_operations": false,
+  "batch_size": 20,
+  "enable_health_monitoring": true,
+  "enable_state_tracking": true
 }

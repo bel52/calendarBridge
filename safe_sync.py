@@ -1,276 +1,311 @@
 #!/usr/bin/env python3
-import os
-import sys
-import json
-import hashlib
-import random
-import time
-import logging
+# -*- coding: utf-8 -*-
+
+import os, sys, json, time, random, glob, math
+from typing import Dict, Any, Optional, Tuple, List
+
+# ---------------- Config & helpers ----------------
+
+def _cfg_load(path: str) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        return json.load(f)
+
+def _sleep_with_jitter(base_seconds: float) -> None:
+    if base_seconds <= 0:
+        return
+    jitter = base_seconds * random.uniform(-0.20, 0.20)
+    time.sleep(max(0.0, base_seconds + jitter))
+
+def _get_retry_after(ex: Exception) -> Optional[float]:
+    try:
+        headers = getattr(ex, "resp", None).headers or {}
+    except Exception:
+        headers = {}
+    ra = headers.get("Retry-After")
+    if not ra:
+        return None
+    try:
+        return float(ra)
+    except Exception:
+        return None
+
+ROOT = os.path.expanduser("~/calendarBridge")
+CONFIG_PATH = os.path.join(ROOT, "calendar_config.json")
+CONF = _cfg_load(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else {}
+
+API_DELAY = float(CONF.get("api_delay_seconds", 1.05))
+TIMEZONE  = CONF.get("timezone", "America/New_York")
+CAL_ID    = CONF.get("google_calendar_id", "primary")
+DAYS_PAST = int(CONF.get("sync_days_past", 60))
+DAYS_FUT  = int(CONF.get("sync_days_future", 90))
+DELETE_ORPHANS = True  # per user instruction
+QUOTA_USER = os.environ.get("CALBRIDGE_QUOTA_USER")
+SLOW_START_MS = int(os.environ.get("CALBRIDGE_SLOW_START_MS", "0"))
+
+if SLOW_START_MS > 0:
+    time.sleep(SLOW_START_MS / 1000.0)
+
+# Late imports so CONFIG is ready
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List
-from dateutil.tz import gettz
-import recurring_ical_events as rie
-from icalendar import Calendar
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
+from icalendar import Calendar
 
-# ----------------------------------------------------------------------
-# Logging configuration
-# ----------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-log = logging.getLogger("safe_sync")
+# OAuth
+creds_path = os.path.join(ROOT, "token.json")
+creds = Credentials.from_authorized_user_file(creds_path)
+service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 
-# ----------------------------------------------------------------------
-# Helper functions
-# ----------------------------------------------------------------------
-def safe_event_id(key: str) -> str:
-    """Generate a deterministic event ID from a composite key."""
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:32]
-    return f"e{digest}"
-
-def gexec(request_callable, verb_hint: str = "", uid_hint: str = "", delay: float = 0.05):
-    """Execute a Google API call with basic rate‑limit handling."""
+def request_with_backoff(req_builder, op_desc: str, max_attempts: int = 6) -> Any:
     attempt = 0
+    backoff = 1.0
     while True:
-        time.sleep(delay)
+        attempt += 1
         try:
-            return request_callable.execute()
+            _sleep_with_jitter(API_DELAY)
+            req = req_builder()
+            if QUOTA_USER:
+                req.uri += ("&" if "?" in req.uri else "?") + f"quotaUser={QUOTA_USER}"
+            return req.execute()
         except HttpError as e:
-            attempt += 1
-            status = getattr(e.resp, "status", None)
-            if status in (403, 429) and attempt <= 5:
-                sleep_s = min(2.0 * attempt, 6.0) + random.uniform(0.1, 0.5)
-                log.info(f"[rate] {verb_hint} uid={uid_hint} got {status}; sleeping {sleep_s:.1f}s (attempt {attempt}/5)")
-                time.sleep(sleep_s)
+            msg = getattr(e, "content", b"")
+            msg_str = msg.decode("utf-8", errors="ignore") if isinstance(msg, (bytes, bytearray)) else str(msg)
+            is_rate = (e.resp.status == 403 and ("rateLimitExceeded" in msg_str or "userRateLimitExceeded" in msg_str))
+            ra = _get_retry_after(e)
+            if is_rate and attempt < max_attempts:
+                wait = ra if ra is not None else backoff + random.uniform(0.0, 0.5)
+                print('Encountered 403 Forbidden with reason "rateLimitExceeded"')
+                print(f"[rate] {op_desc} got 403; sleeping {round(wait,2)}s (attempt {attempt}/{max_attempts})")
+                time.sleep(wait)
+                backoff = min(backoff * 2.0, 16.0)
+                continue
+            raise
+        except Exception:
+            if attempt < max_attempts:
+                wait = backoff + random.uniform(0.0, 0.5)
+                print(f"[warn] {op_desc} transient error; sleeping {round(wait,2)}s (attempt {attempt}/{max_attempts})")
+                time.sleep(wait)
+                backoff = min(backoff * 2.0, 16.0)
                 continue
             raise
 
-def parse_ics(path: str, tzname: str, start_window: datetime, end_window: datetime) -> List[Dict[str, Any]]:
-    """Parse a cleaned .ics file and return occurrences in the desired window."""
-    tz = gettz(tzname)
-    instances: List[Dict[str, Any]] = []
-    with open(path, "rb") as f:
-        cal = Calendar.from_ical(f.read())
-    try:
-        occs = rie.of(cal).between(start_window, end_window)
-    except Exception as e:
-        log.info(f"[WARN] Failed to expand recurrences in {path}: {e}")
-        return instances
+# ---------------- ICS ingest ----------------
 
-    for comp in occs:
-        if comp.name != "VEVENT":
-            continue
-        uid = str(comp.get("UID") or "").strip()
-        if not uid:
-            continue
-        summary = str(comp.get("SUMMARY") or "").strip()
-        description = str(comp.get("DESCRIPTION") or "").strip()
-        location = str(comp.get("LOCATION") or "").strip()
-        dtstart = comp.get("DTSTART").dt if comp.get("DTSTART") else None
-        dtend = comp.get("DTEND").dt if comp.get("DTEND") else None
-        all_day = False
-        if isinstance(dtstart, datetime):
-            dtstart = dtstart.astimezone(gettz(tzname))
-        else:
-            all_day = True
-            dtstart = tz.localize(datetime(dtstart.year, dtstart.month, dtstart.day))
-        if isinstance(dtend, datetime):
-            dtend = dtend.astimezone(gettz(tzname))
-        else:
-            if dtend is not None:
-                dtend = tz.localize(datetime(dtend.year, dtend.month, dtend.day))
-            else:
-                dtend = dtstart + timedelta(hours=1)
-        instances.append({
-            "uid": uid,
-            "summary": summary,
-            "description": description,
-            "location": location,
-            "start": dtstart,
-            "end": dtend,
-            "all_day": all_day,
-        })
-    return instances
+def _iso(dt) -> str:
+    # Force ISO 8601 with timezone when possible
+    if hasattr(dt, "tzinfo") and dt.tzinfo is not None:
+        return dt.isoformat()
+    # Assume local TZ if naive
+    return dt.replace(tzinfo=timezone.utc).isoformat()
 
-def load_config() -> Dict[str, Any]:
-    """Always load calendar_config.json relative to this script."""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    cfg_path = os.path.join(base_dir, "calendar_config.json")
-    with open(cfg_path) as f:
-        return json.load(f)
+def load_local(outbox_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Return dict keyed by (uid|startIso) for instances."""
+    events: Dict[str, Dict[str, Any]] = {}
+    paths = glob.glob(os.path.join(outbox_dir, "*.ics"))
+    if not paths:
+        # fallback to the combined export filename
+        p = os.path.join(outbox_dir, "outlook_full_export.ics")
+        if os.path.exists(p):
+            paths = [p]
 
-def get_service():
-    """Obtain or refresh Google credentials, prompting once if token is missing."""
-    scopes = ["https://www.googleapis.com/auth/calendar"]
-    creds = None
-    token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
-    creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, scopes)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception:
-                pass
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(creds_path, scopes)
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w") as token_file:
-            token_file.write(creds.to_json())
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+    for path in paths:
+        try:
+            with open(path, "rb") as f:
+                cal = Calendar.from_ical(f.read())
+            for comp in cal.walk("VEVENT"):
+                uid = str(comp.get("UID"))
+                dtstart = comp.get("DTSTART").dt
+                dtend   = comp.get("DTEND").dt
+                all_day = not hasattr(dtstart, "hour")
+                key = f"{uid}|{_iso(dtstart)}"
 
-def load_state(path: str) -> Dict[str, str]:
-    """Load sync state relative to this script."""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    full_path = os.path.join(base_dir, path)
-    if os.path.exists(full_path):
-        with open(full_path) as f:
-            return json.load(f)
-    return {}
+                events[key] = {
+                    "uid": uid,
+                    "summary": (comp.get("SUMMARY") or "").strip(),
+                    "location": (comp.get("LOCATION") or "").strip(),
+                    "description": (comp.get("DESCRIPTION") or "").strip(),
+                    "start": dtstart,
+                    "end": dtend,
+                    "allDay": all_day
+                }
+        except Exception as e:
+            print(f"[warn] Failed to parse {path}: {e}")
+    return events
 
-def save_state(path: str, state: Dict[str, str]):
-    """Save sync state relative to this script."""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    full_path = os.path.join(base_dir, path)
-    with open(full_path, "w") as f:
-        json.dump(state, f, indent=2)
+def to_body(ev: Dict[str, Any], tz: str) -> Dict[str, Any]:
+    if ev["allDay"]:
+        return {
+            "summary": ev["summary"] or None,
+            "location": ev["location"] or None,
+            "description": ev["description"] or None,
+            "start": {"date": ev["start"].date().isoformat(), "timeZone": tz},
+            "end":   {"date": ev["end"].date().isoformat(),   "timeZone": tz},
+            # keep a private echo of the UID as a second anchor
+            "extendedProperties": {"private": {"icalUID": ev["uid"]}}
+        }
+    else:
+        return {
+            "summary": ev["summary"] or None,
+            "location": ev["location"] or None,
+            "description": ev["description"] or None,
+            "start": {"dateTime": _iso(ev["start"]), "timeZone": tz},
+            "end":   {"dateTime": _iso(ev["end"]),   "timeZone": tz},
+            "extendedProperties": {"private": {"icalUID": ev["uid"]}}
+        }
 
-def get_existing_events(service, calendar_id: str, time_min: str, time_max: str) -> Dict[str, Dict[str, Any]]:
-    """Retrieve existing events in the specified window."""
-    existing_events: Dict[str, Dict[str, Any]] = {}
+def same_enough(desired: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    for k in ("summary", "description", "location"):
+        if (desired.get(k) or "") != (current.get(k) or ""):
+            return False
+    def norm(t):
+        if not t: return ""
+        return t.get("dateTime") or (t.get("date") + "T00:00:00")
+    return norm(desired.get("start")) == norm(current.get("start")) and \
+           norm(desired.get("end"))   == norm(current.get("end"))
+
+# ---------------- Google side ----------------
+
+def time_window() -> Tuple[str, str]:
+    now = datetime.now(timezone.utc)
+    tmin = now - timedelta(days=DAYS_PAST)
+    tmax = now + timedelta(days=DAYS_FUT)
+    return tmin.isoformat(), tmax.isoformat()
+
+def list_google_events(calendar_id: str, tmin: str, tmax: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
     page_token = None
     while True:
-        res = gexec(
-            service.events().list(
+        def _builder():
+            return service.events().list(
                 calendarId=calendar_id,
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                showDeleted=False,
-                maxResults=2500,
-                pageToken=page_token
-            ),
-            verb_hint="events.list"
-        )
-        for ev in res.get("items", []):
-            existing_events[ev["id"]] = ev
-        page_token = res.get("nextPageToken")
+                timeMin=tmin, timeMax=tmax,
+                singleEvents=True, showDeleted=False,
+                maxResults=2500, pageToken=page_token, orderBy="startTime"
+            )
+        resp = request_with_backoff(_builder, "events.list window")
+        items.extend(resp.get("items", []))
+        page_token = resp.get("nextPageToken")
         if not page_token:
             break
-    return existing_events
+    return items
 
-# ----------------------------------------------------------------------
-# Main sync logic
-# ----------------------------------------------------------------------
-def safe_sync():
-    cfg = load_config()
-    calendar_id = cfg.get("google_calendar_id", "primary")
-    tzname = cfg.get("timezone", "UTC")
-    sync_days_past = cfg.get("sync_days_past", 90)
-    sync_days_future = cfg.get("sync_days_future", 120)
-    api_delay = cfg.get("api_delay_seconds", 0.05)
+def key_for_google_item(g: Dict[str, Any]) -> Optional[str]:
+    # Prefer Google's native iCalUID; fall back to our private property.
+    ical = g.get("iCalUID")
+    if not ical:
+        ical = (g.get("extendedProperties", {}).get("private", {}) or {}).get("icalUID")
+    if not ical:
+        return None
+    st = g.get("start", {})
+    start_iso = st.get("dateTime") or (st.get("date") + "T00:00:00")
+    return f"{ical}|{start_iso}"
 
-    tz = gettz(tzname)
-    now = datetime.now(tz)
-    start_window = now - timedelta(days=sync_days_past)
-    end_window = now + timedelta(days=sync_days_future)
+def find_by_icaluid(calendar_id: str, ical_uid: str) -> Optional[Dict[str, Any]]:
+    try:
+        resp = request_with_backoff(
+            lambda: service.events().list(calendarId=calendar_id, iCalUID=ical_uid, singleEvents=True, maxResults=5),
+            f"events.list iCalUID={ical_uid}"
+        )
+        items = resp.get("items", [])
+        return items[0] if items else None
+    except Exception as e:
+        print(f"[warn] list by iCalUID failed for {ical_uid}: {e}")
+        return None
 
-    # Prepare outbox
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    outbox = os.path.join(base_dir, "outbox")
-    ics_files = [os.path.join(outbox, f) for f in os.listdir(outbox) if f.startswith("clean_") and f.endswith(".ics")]
-    if not ics_files:
-        log.error("No cleaned .ics files found. Run clean_ics_files.py first.")
-        sys.exit(1)
+# ---------------- Main sync ----------------
 
-    # Parse all .ics files
-    all_instances: List[Dict[str, Any]] = []
-    for path in ics_files:
-        all_instances.extend(parse_ics(path, tzname, start_window, end_window))
-    log.info(f"[INFO] Parsed {len(all_instances)} event instances from .ics files.")
+def main():
+    outbox = os.path.join(ROOT, "outbox")
+    local = load_local(outbox)
+    print(f"[INFO] Parsed {len(local)} event instances from .ics files.")
 
-    # Build new_events keyed by composite key
-    new_events: Dict[str, Dict[str, Any]] = {}
-    for inst in all_instances:
-        key = f"{inst['uid']}|{inst['start'].isoformat()}"  # uid plus start ISO
-        new_events[key] = inst
+    tmin, tmax = time_window()
+    g_items = list_google_events(CAL_ID, tmin, tmax)
 
-    # Load previous sync state
-    state_file = "sync_state.json"
-    state = load_state(state_file)
-    service = get_service()
+    # Build google map
+    g_map: Dict[str, Dict[str, Any]] = {}
+    for g in g_items:
+        k = key_for_google_item(g)
+        if k:
+            g_map[k] = g
 
-    # Fetch existing events within window
-    time_min = start_window.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    time_max = end_window.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    existing_events = get_existing_events(service, calendar_id, time_min, time_max)
+    created = updated = skipped = deleted = failed = 0
 
-    created = updated = skipped = 0
+    # 1) INSERT or UPDATE
+    for k, ev in local.items():
+        uid = ev["uid"]
+        body = to_body(ev, TIMEZONE)
 
-    # Delete events no longer present
-    for key in list(state.keys()):
-        if key not in new_events:
-            event_id = state[key]
-            if event_id in existing_events:
-                try:
-                    gexec(service.events().delete(calendarId=calendar_id, eventId=event_id),
-                          verb_hint="events.delete", uid_hint=key, delay=api_delay)
-                    log.info(f"[DEL ] {key} -> event {event_id}")
-                except HttpError as e:
-                    if getattr(e.resp, "status", None) in (404, 410):
-                        log.info(f"[DEL ] {key} already absent")
-                    else:
-                        log.error(f"[ERR ] Deleting {key}: {e}")
-            state.pop(key, None)
+        g = g_map.get(k)
+        if g is None:
+            # brand-new -> IMPORT so we can set iCalUID
+            def _builder():
+                b = dict(body)
+                b["iCalUID"] = uid  # events.import honors this
+                return service.events().import_(calendarId=CAL_ID, body=b)
+            try:
+                resp = request_with_backoff(_builder, f"events.import uid={uid}")
+                if resp and resp.get("id"):
+                    created += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                print(f"[warn] import failed uid={uid}: {e}")
+                failed += 1
+            continue
 
-    # Insert or update events
-    for key, inst in new_events.items():
-        event_id = state.get(key) or safe_event_id(key)
-        body = {
-            "summary": inst["summary"],
-            "description": inst["description"],
-            "location": inst["location"],
-            "start": {"dateTime": inst["start"].isoformat()} if not inst["all_day"] else {"date": inst["start"].date().isoformat()},
-            "end": {"dateTime": inst["end"].isoformat()} if not inst["all_day"] else {"date": inst["end"].date().isoformat()},
+        # Exists -> PATCH if changed
+        current_reduced = {
+            "summary": g.get("summary"),
+            "description": g.get("description"),
+            "location": g.get("location"),
+            "start": g.get("start", {}),
+            "end": g.get("end", {})
         }
-        try:
-            if event_id in existing_events:
-                existing = existing_events[event_id]
-                if (existing.get("summary") == body["summary"]
-                        and existing.get("description") == body["description"]
-                        and existing.get("location") == body["location"]
-                        and existing.get("start") == body["start"]
-                        and existing.get("end") == body["end"]):
-                    skipped += 1
-                    state[key] = event_id
-                    continue
-                gexec(service.events().patch(calendarId=calendar_id, eventId=event_id, body=body),
-                      verb_hint="events.patch", uid_hint=key, delay=api_delay)
-                updated += 1
-            else:
-                gexec(service.events().insert(calendarId=calendar_id, body={"id": event_id, **body}),
-                      verb_hint="events.insert", uid_hint=key, delay=api_delay)
-                created += 1
-            state[key] = event_id
-        except HttpError as e:
-            if getattr(e.resp, "status", None) == 409:
-                gexec(service.events().patch(calendarId=calendar_id, eventId=event_id, body=body),
-                      verb_hint="events.patch", uid_hint=key, delay=api_delay)
-                updated += 1
-                state[key] = event_id
-            else:
-                raise
+        desired_reduced = {
+            "summary": body.get("summary"),
+            "description": body.get("description"),
+            "location": body.get("location"),
+            "start": body.get("start"),
+            "end": body.get("end")
+        }
+        if same_enough(desired_reduced, current_reduced):
+            skipped += 1
+            continue
 
-    save_state(state_file, state)
-    log.info(f"[DONE] Created: {created}, Updated: {updated}, Skipped: {skipped}")
+        gid = g["id"]
+        try:
+            resp = request_with_backoff(
+                lambda: service.events().patch(calendarId=CAL_ID, eventId=gid, body=body, sendUpdates="none"),
+                f"events.patch uid={uid}"
+            )
+            if resp and resp.get("id"):
+                updated += 1
+            else:
+                failed += 1
+        except Exception as e:
+            print(f"[warn] patch failed uid={uid}: {e}")
+            failed += 1
+
+    # 2) DELETE ORPHANS (in window)
+    if DELETE_ORPHANS:
+        local_keys = set(local.keys())
+        for k, g in g_map.items():
+            if k in local_keys:
+                continue
+            gid = g["id"]
+            try:
+                request_with_backoff(
+                    lambda: service.events().delete(calendarId=CAL_ID, eventId=gid, sendUpdates="none"),
+                    f"events.delete gid={gid}"
+                )
+                deleted += 1
+            except Exception as e:
+                print(f"[warn] delete failed gid={gid}: {e}")
+                failed += 1
+
+    print(f"[DONE] Created: {created}, Updated: {updated}, Skipped: {skipped}, Deleted: {deleted}, Failed: {failed}")
 
 if __name__ == "__main__":
-    safe_sync()
+    main()

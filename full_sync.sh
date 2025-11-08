@@ -1,58 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- CONFIG ---
 ROOT="${HOME}/calendarBridge"
 VENV="${ROOT}/.venv"
-OUTBOX="${ROOT}/outbox"
-LOGDIR="${ROOT}/logs"
-PY=${VENV}/bin/python
-DATESTAMP="$(date '+%Y-%m-%d_%H-%M-%S')"
-LOGFILE="${LOGDIR}/full_sync_${DATESTAMP}.log"
+PY="${VENV}/bin/python"
+LOG_TS="$(date '+%Y-%m-%d_%H-%M-%S')"
 
-# Pass these to select the right Outlook calendar:
-CALENDAR_NAME="${CALENDAR_NAME:-Calendar}"
-CALENDAR_INDEX="${CALENDAR_INDEX:-2}"   # 2nd calendar named "Calendar"
-
-mkdir -p "${LOGDIR}" "${OUTBOX}"
-
-exec > >(tee -a "${LOGFILE}") 2>&1
-
-echo "========== CalendarBridge Full Sync :: ${DATESTAMP} =========="
+echo "========== CalendarBridge Full Sync :: ${LOG_TS} =========="
 echo "[INFO] Using ROOT=${ROOT}"
 echo "[INFO] Python path: ${PY}"
+"${PY}" -V
 
-# shellcheck disable=SC1091
-source "${VENV}/bin/activate" || true
-echo "[INFO] Python version: $(python -V 2>&1 || echo 'N/A')"
-echo "[INFO] PIP packages:"
-pip freeze | sed 's/^/[PKG] /' || true
+# Light jitter so multiple launches don't align to the same second
+sleep "$(python3 - <<'PY'
+import random; print(round(random.uniform(0.3,0.7),2))
+PY
+)"
 
-echo "[STEP] 1/4 Export Outlook events -> ${OUTBOX}"
-echo "[INFO] Export args: name='${CALENDAR_NAME}' index='${CALENDAR_INDEX}'"
-osascript "${ROOT}/exportEvents.scpt" "${CALENDAR_NAME}" "${CALENDAR_INDEX}" || { echo "[ERR ] AppleScript export failed"; exit 10; }
+# Export env knobs read by safe_sync.py (if present)
+export CALBRIDGE_QUOTA_USER="brett@leathermans.net"   # helps Google bucket requests
+export CALBRIDGE_SLOW_START_MS=300                     # tiny initial pause before first write
+
+echo "[STEP] 1/4 Export Outlook events -> ${ROOT}/outbox"
+echo "[INFO] Export args: name='Calendar' index='2'"
+osascript "${ROOT}/exportEvents.scpt" "Calendar" "2"
+
+echo "[OK  ] Outlook export completed"
 
 echo "[STEP] 2/4 Count .ics files"
-ICS_COUNT=$(find "${OUTBOX}" -type f -name '*.ics' | wc -l | tr -d ' ')
-echo "[INFO] Found ${ICS_COUNT} .ics files in outbox"
-if [[ "${ICS_COUNT}" -eq 0 ]]; then
-  echo "[WARN] No .ics exported. Stopping so we don't wipe Google with empty input."
-  exit 20
-fi
+count=$(find "${ROOT}/outbox" -type f -name '*.ics' | wc -l | tr -d ' ')
+echo "[INFO] Found ${count} .ics files in outbox"
 
-echo "[STEP] 3/4 Clean headers if cleaner exists"
-if [[ -f "${ROOT}/clean_ics_files.py" ]]; then
-  python "${ROOT}/clean_ics_files.py" || { echo "[WARN] clean_ics_files.py had issues, continuing"; }
-fi
+echo "[STEP] 3/4 Clean ICS headers"
+"${PY}" "${ROOT}/clean_ics_files.py" --inbox "${ROOT}/outbox"
 
 echo "[STEP] 4/4 Run main sync"
-if [[ -f "${ROOT}/safe_sync.py" ]]; then
-  python "${ROOT}/safe_sync.py" --verbose || { echo "[ERR ] safe_sync.py failed"; exit 30; }
-elif [[ -f "${ROOT}/calendar_sync.py" ]]; then
-  python "${ROOT}/calendar_sync.py" --verbose || { echo "[ERR ] calendar_sync.py failed"; exit 31; }
-else
-  echo "[ERR ] No main sync script present"
-  exit 32
-fi
+"${PY}" "${ROOT}/safe_sync.py" --config "${ROOT}/calendar_config.json"
 
-echo "[DONE] Full sync completed at ${DATESTAMP}"
+echo "SYNC OK :: ${LOG_TS}"
