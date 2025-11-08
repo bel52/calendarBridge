@@ -32,3 +32,9 @@ launchd.err
 
 # Local backups
 *.bak*
+sync_state.json
+sync_state_backup.json
+.idea/
+sync_state.json
+sync_state_backup.json
+.idea/
