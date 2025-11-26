@@ -2,27 +2,34 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.calendarbridge.sync</string>
+  <key>Label</key>
+  <string>com.calendarbridge.sync</string>
 
+  <!-- Use the wrapper so we only run when Outlook is actually up -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>/calendarBridge/full_sync.sh</string>
+    <string>/Users/bel/calendarBridge/run_sync_wrapper.sh</string>
   </array>
 
-  <!-- Fire at :05 every hour -->
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Minute</key><integer>5</integer>
-  </dict>
+  <!-- Run approximately every 30 minutes -->
+  <key>StartInterval</key>
+  <integer>1800</integer>
 
-  <key>RunAtLoad</key><true/>
+  <!-- Also run once right after login/load -->
+  <key>RunAtLoad</key>
+  <true/>
 
-  <key>StandardOutPath</key><string>/calendarBridge/logs/launchd.stdout.log</string>
-  <key>StandardErrorPath</key><string>/calendarBridge/logs/launchd.stderr.log</string>
+  <!-- LaunchAgent logs (in addition to wrapper logs) -->
+  <key>StandardOutPath</key>
+  <string>/Users/bel/calendarBridge/logs/launchd.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/bel/calendarBridge/logs/launchd.stderr.log</string>
 
-  <key>LimitLoadToSessionType</key><string>Aqua</string>
-  <key>AbandonProcessGroup</key><true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>AbandonProcessGroup</key>
+  <true/>
 </dict>
 </plist>
