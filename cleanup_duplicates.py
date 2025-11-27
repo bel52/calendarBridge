@@ -1,348 +1,319 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-cleanup_duplicates.py
+Cleanup duplicate Google Calendar events.
 
-Cleanup script to remove duplicate events from Google Calendar
-for keys (iCalUID|normalized start), keeping exactly ONE event
-per key.
+Default behavior:
+- Scans the same date window used by safe_sync.py (config-driven).
+- Groups events by (UID, normalized start, normalized end, summary).
+- Keeps ONE event per group (oldest by created time).
+- Deletes only events tagged as ours:
+    extendedProperties.private.source == "CalendarBridge"
 
-Key points:
-- Groups ALL events (ours + non-ours) by the same key safe_sync.py uses:
-    key = f"{iCalUID}|<normalized start>"
-- For each group with >= 2 events:
-    * Choose ONE canonical event to KEEP:
-        - Prefer event whose ID matches sync_state["google_ids"][key].
-        - Else, prefer one with extendedProperties.private.source == "calendarbridge".
-        - Else, keep the first.
-    * DELETE all other events in the group.
-- We NEVER delete all events for a key; at least one survives.
+Optional aggressive mode:
+- If --include-all is passed, deletes ALL extra copies in each group
+  (regardless of source) and keeps just one.
 
-Default mode:
-- DRY RUN (no deletions). Use --apply to actually delete.
+Usage:
+    ./cleanup_duplicates.py                      # dry-run, conservative
+    ./cleanup_duplicates.py --apply              # delete safe (CalendarBridge) duplicates
+    ./cleanup_duplicates.py --apply --include-all  # delete all extras per group
 """
 
 import os
 import sys
 import json
 import time
-import random
-import argparse
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Tuple, List, Optional
 
-ROOT = os.path.expanduser("~/calendarBridge")
-CONFIG_PATH = os.path.join(ROOT, "calendar_config.json")
-STATE_PATH = os.path.join(ROOT, "sync_state.json")
-
-LOG_PREFIX = "[CLEANUP]"
-
-# --------- Config helpers ---------
-
-def load_config(path: str) -> Dict[str, Any]:
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return {}
-
-CONF = load_config(CONFIG_PATH)
-
-TIMEZONE = CONF.get("timezone", "America/New_York")
-CAL_ID = CONF.get("google_calendar_id", "primary")
-DAYS_PAST = int(CONF.get("sync_days_past", 60))
-DAYS_FUTURE = int(CONF.get("sync_days_future", 90))
-API_DELAY = float(CONF.get("api_delay_seconds", 0.15))
-QUOTA_USER = os.environ.get("CALBRIDGE_QUOTA_USER")
-ORPHAN_MARKER = "calendarbridge"
-
-# --------- Google API + backoff ---------
-
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.oauth2.credentials import Credentials
 
-def get_google_service():
-    creds_path = os.path.join(ROOT, "token.json")
-    creds = Credentials.from_authorized_user_file(creds_path)
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+ROOT = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(ROOT, "calendar_config.json")
+TOKEN_PATH = os.path.join(ROOT, "token.json")
+CREDENTIALS_PATH = os.path.join(ROOT, "credentials.json")
+LOG_DIR = os.path.join(ROOT, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "cleanup_duplicates.log")
+REPORT_PATH = os.path.join(LOG_DIR, "cleanup_duplicates_report.json")
 
-def sleep_with_jitter(base_seconds: float) -> None:
-    if base_seconds <= 0:
-        return
-    jitter = base_seconds * random.uniform(-0.20, 0.20)
-    time.sleep(max(0.0, base_seconds + jitter))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("calendarbridge.cleanup")
 
-def is_rate_limit_error(e: HttpError) -> bool:
-    try:
-        status = e.resp.status if hasattr(e, "resp") else None
-        if status in (429,):
-            return True
-        if status == 403:
-            content = getattr(e, "content", b"") or b""
-            msg = content.decode("utf-8", errors="ignore")
-            return "rateLimitExceeded" in msg or "userRateLimitExceeded" in msg
-    except Exception:
-        pass
-    return False
+ORPHAN_MARKER = "CalendarBridge"
 
-def request_with_backoff(service, req_builder, op_desc: str, max_attempts: int = 5) -> Any:
-    attempt = 0
-    backoff = 1.0
-    while True:
-        attempt += 1
+
+# ------------- Config & Auth -------------
+
+def load_config() -> Dict[str, Any]:
+    if not os.path.exists(CONFIG_PATH):
+        raise SystemExit(f"Missing config file: {CONFIG_PATH}")
+    with open(CONFIG_PATH, "r") as f:
+        cfg = json.load(f)
+    required = ["google_calendar_id", "sync_days_past", "sync_days_future"]
+    missing = [k for k in required if k not in cfg]
+    if missing:
+        raise SystemExit(f"Missing keys in calendar_config.json: {missing}")
+    return cfg
+
+
+def get_google_service(scopes=None):
+    if scopes is None:
+        scopes = ["https://www.googleapis.com/auth/calendar"]
+    creds = None
+    if os.path.exists(TOKEN_PATH):
         try:
-            sleep_with_jitter(API_DELAY)
-            req = req_builder()
-            if QUOTA_USER:
-                req.uri += ("&" if "?" in req.uri else "?") + f"quotaUser={QUOTA_USER}"
-            return req.execute()
-        except HttpError as e:
-            if is_rate_limit_error(e) and attempt < max_attempts:
-                wait = backoff + random.uniform(0.0, 1.0)
-                print(f"{LOG_PREFIX} rate-limited on {op_desc}, sleeping {wait:.1f}s (attempt {attempt})")
-                time.sleep(wait)
-                backoff = min(backoff * 2.0, 30.0)
-                continue
-            raise
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, scopes)
         except Exception as e:
-            if attempt < max_attempts:
-                wait = backoff + random.uniform(0.0, 0.5)
-                print(f"{LOG_PREFIX} error on {op_desc}: {e}, retrying in {wait:.1f}s")
-                time.sleep(wait)
-                backoff = min(backoff * 2.0, 30.0)
-                continue
-            raise
+            log.warning(f"Failed to load token.json, re-auth required: {e}")
+            creds = None
 
-# --------- State helpers (read-only) ---------
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                log.warning(f"Token refresh failed, re-authenticating: {e}")
+                creds = None
 
-def load_state(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {"events": {}, "google_ids": {}}
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {"events": {}, "google_ids": {}}
+        if not creds:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, scopes)
+            creds = flow.run_local_server(port=0)
 
-# --------- Key & ownership helpers (MUST MATCH safe_sync) ---------
+        with open(TOKEN_PATH, "w") as token:
+            token.write(creds.to_json())
 
-def normalize_start_string(start_obj: Dict[str, Any]) -> str:
-    """
-    Convert a Google event 'start' object into the same normalized
-    string safe_sync uses: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
-    with any timezone/offset stripped.
-    """
-    start_str = start_obj.get("date") or start_obj.get("dateTime", "")
-    if not start_str:
-        return ""
-    if "T" not in start_str:
-        # all-day
-        return start_str
-    parts = start_str.split("T")
-    rest = parts[1]
+    return build("calendar", "v3", credentials=creds)
 
-    # Remove timezone (e.g. +HH:MM, -HH:MM, or 'Z')
-    if "+" in rest:
-        rest = rest.split("+", 1)[0]
-    elif "-" in rest[1:]:
-        rest = rest.split("-", 1)[0]
-    elif rest.endswith("Z"):
-        rest = rest[:-1]
 
-    time_part = rest[:8]
-    return f"{parts[0]}T{time_part}"
-
-def make_key_from_event(item: Dict[str, Any]) -> str | None:
-    ical_uid = item.get("iCalUID")
-    if not ical_uid:
-        ext = item.get("extendedProperties", {}).get("private", {}) or {}
-        ical_uid = ext.get("icalUID")
-    if not ical_uid:
-        return None
-    start = item.get("start", {})
-    start_str = normalize_start_string(start)
-    if not start_str:
-        return None
-    return f"{ical_uid}|{start_str}"
-
-def is_our_event(ev: Dict[str, Any]) -> bool:
-    ext = ev.get("extendedProperties", {}).get("private", {}) or {}
-    return ext.get("source") == ORPHAN_MARKER
-
-# --------- Fetch events ---------
-
-def get_time_window_iso() -> Tuple[str, str]:
+def get_time_window_iso(cfg: Dict[str, Any]) -> Tuple[str, str]:
     now = datetime.now(timezone.utc)
-    time_min = now - timedelta(days=DAYS_PAST)
-    time_max = now + timedelta(days=DAYS_FUTURE)
+    time_min = now - timedelta(days=int(cfg["sync_days_past"]))
+    time_max = now + timedelta(days=int(cfg["sync_days_future"]))
     return time_min.isoformat(), time_max.isoformat()
 
-def fetch_all_events(service) -> List[Dict[str, Any]]:
-    time_min, time_max = get_time_window_iso()
-    print(f"{LOG_PREFIX} scanning window {time_min} → {time_max}")
+
+# ------------- Helpers -------------
+
+def _normalize_start(start: Dict[str, Any]) -> Optional[str]:
+    if not start:
+        return None
+    if "date" in start:
+        return start["date"]
+    dt_str = start.get("dateTime")
+    if not dt_str:
+        return None
+    if "T" not in dt_str:
+        return dt_str
+    date_part, time_part = dt_str.split("T", 1)
+    time_part = time_part.split("+")[0].split("-")[0]
+    time_part = time_part[:8]
+    return f"{date_part}T{time_part}"
+
+
+def _normalize_end(end: Dict[str, Any]) -> Optional[str]:
+    if not end:
+        return None
+    if "date" in end:
+        return end["date"]
+    dt_str = end.get("dateTime")
+    if not dt_str:
+        return None
+    if "T" not in dt_str:
+        return dt_str
+    date_part, time_part = dt_str.split("T", 1)
+    time_part = time_part.split("+")[0].split("-")[0]
+    time_part = time_part[:8]
+    return f"{date_part}T{time_part}"
+
+
+def is_our_event(ev: Dict[str, Any]) -> bool:
+    ext = (ev.get("extendedProperties") or {}).get("private") or {}
+    return ext.get("source") == ORPHAN_MARKER
+
+
+def get_uid(ev: Dict[str, Any]) -> Optional[str]:
+    ext = (ev.get("extendedProperties") or {}).get("private") or {}
+    return ext.get("icalUID") or ev.get("iCalUID")
+
+
+# ------------- Fetch & Group -------------
+
+def fetch_events(service, calendar_id: str, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    time_min, time_max = get_time_window_iso(cfg)
     events: List[Dict[str, Any]] = []
     page_token = None
+    total = 0
+
     while True:
-        resp = request_with_backoff(
-            service,
-            lambda: service.events().list(
-                calendarId=CAL_ID,
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                showDeleted=False,
-                maxResults=2500,
-                pageToken=page_token,
-                orderBy="startTime",
-            ),
-            "events.list",
-        )
-        events.extend(resp.get("items", []))
+        try:
+            resp = (
+                service.events()
+                .list(
+                    calendarId=calendar_id,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    singleEvents=True,
+                    showDeleted=False,
+                    maxResults=2500,
+                    orderBy="startTime",
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+        except HttpError as e:
+            log.error(f"Failed to fetch events: {e}")
+            break
+
+        items = resp.get("items", [])
+        total += len(items)
+        events.extend(items)
+
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-    print(f"{LOG_PREFIX} fetched {len(events)} events in window")
+
+    log.info(f"Fetched {total} events in cleanup window")
     return events
 
-# --------- Analyze duplicate groups ---------
 
-def analyze_duplicates(events: List[Dict[str, Any]], state: Dict[str, Any]):
+def group_duplicates(events: List[Dict[str, Any]]) -> Dict[Tuple[str, str, str, str], List[Dict[str, Any]]]:
     """
-    Analyze duplicates per key.
-
-    We group ALL events by key, then look for keys where there are
-    2 or more events. For each such group we will keep exactly one.
+    Group events by (uid, normalized_start, normalized_end, summary)
+    Only groups with len > 1 are considered duplicates.
     """
-    groups: Dict[str, List[Dict[str, Any]]] = {}
+    groups: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
 
     for ev in events:
-        key = make_key_from_event(ev)
-        if not key:
+        uid = get_uid(ev)
+        if not uid:
             continue
+
+        start_key = _normalize_start(ev.get("start") or {})
+        end_key = _normalize_end(ev.get("end") or {})
+        if not start_key or not end_key:
+            continue
+
+        summary = (ev.get("summary") or "").strip()
+        key = (uid, start_key, end_key, summary)
+
         groups.setdefault(key, []).append(ev)
 
-    state_google_ids: Dict[str, str] = state.get("google_ids", {})
+    dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
+    log.info(f"Identified {len(dup_groups)} duplicate groups (>=2 events per group)")
+    return dup_groups
 
-    dup_info: Dict[str, Dict[str, Any]] = {}
 
-    for key, evs in groups.items():
-        if len(evs) <= 1:
-            continue
+def pick_keep_and_delete(events: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Given a list of duplicate events, choose one to keep (oldest by created time),
+    and return (keep_event, [events_to_delete]).
+    """
+    def created_ts(ev: Dict[str, Any]) -> float:
+        created_str = ev.get("created") or ev.get("updated")
+        if not created_str:
+            return 0.0
+        try:
+            return datetime.fromisoformat(created_str.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
 
-        # Build ID lists
-        ids = [e.get("id") for e in evs if e.get("id")]
-        if not ids:
-            continue
+    sorted_events = sorted(events, key=created_ts)
+    keep = sorted_events[0]
+    delete = sorted_events[1:]
+    return keep, delete
 
-        # Choose canonical to KEEP
-        canonical_state_id = state_google_ids.get(key)
-        keep_id = None
 
-        # 1) Prefer the one referenced in sync_state.json
-        if canonical_state_id and canonical_state_id in ids:
-            keep_id = canonical_state_id
-        else:
-            # 2) Prefer one marked as our event
-            ours = [e for e in evs if is_our_event(e) and e.get("id")]
-            if ours:
-                keep_id = ours[0].get("id")
-            else:
-                # 3) Fallback to first
-                keep_id = ids[0]
-
-        delete_ids = [i for i in ids if i != keep_id]
-
-        ours_ids = [e.get("id") for e in evs if is_our_event(e) and e.get("id")]
-        not_ours_ids = [e.get("id") for e in evs if (not is_our_event(e)) and e.get("id")]
-
-        dup_info[key] = {
-            "count_total": len(evs),
-            "keep_id": keep_id,
-            "delete_ids": delete_ids,
-            "ours_ids": ours_ids,
-            "not_ours_ids": not_ours_ids,
-            "sample_summary": evs[0].get("summary", ""),
-            "start": evs[0].get("start", {}),
-        }
-
-    return dup_info
-
-# --------- Deletion ---------
-
-def delete_duplicates(service, dup_info: Dict[str, Dict[str, Any]], apply: bool):
-    total_groups = len(dup_info)
-    total_delete = sum(len(v["delete_ids"]) for v in dup_info.values())
-    print(f"{LOG_PREFIX} found {total_groups} duplicate groups (keys with >=2 events); {total_delete} events marked for deletion.")
-
-    if not dup_info:
-        return
-
-    print(f"{LOG_PREFIX} sample groups:")
-    shown = 0
-    for key, info in dup_info.items():
-        print(f"  key={key}")
-        print(f"    summary:        {info['sample_summary']}")
-        print(f"    total events:   {info['count_total']}")
-        print(f"    ours:           {info['ours_ids']}")
-        print(f"    not ours:       {info['not_ours_ids']}")
-        print(f"    KEEP:           {info['keep_id']}")
-        print(f"    DELETE:         {info['delete_ids']}")
-        shown += 1
-        if shown >= 5:
-            break
-
-    if not apply:
-        print(f"{LOG_PREFIX} DRY RUN ONLY – no deletions performed. Re-run with --apply to actually delete.")
-        return
-
-    print(f"{LOG_PREFIX} APPLY MODE – deleting {total_delete} events...")
-    deleted = 0
-    failed = 0
-    for key, info in dup_info.items():
-        for gid in info["delete_ids"]:
-            try:
-                request_with_backoff(
-                    service,
-                    lambda gid=gid: service.events().delete(
-                        calendarId=CAL_ID,
-                        eventId=gid,
-                        sendUpdates="none",
-                    ),
-                    f"delete duplicate {gid}",
-                )
-                deleted += 1
-            except HttpError as e:
-                if e.resp.status == 410:
-                    deleted += 1
-                else:
-                    failed += 1
-                    print(f"{LOG_PREFIX} delete failed for {gid}: {e.resp.status}")
-            except Exception as e:
-                failed += 1
-                print(f"{LOG_PREFIX} delete error for {gid}: {e}")
-
-    print(f"{LOG_PREFIX} deletion complete. Deleted={deleted}, Failed={failed}")
-
-# --------- Main ---------
+# ------------- Main cleanup -------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Cleanup duplicate events from Google Calendar (keep exactly one per iCalUID/start key)."
-    )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Actually delete duplicates (default is dry-run).",
-    )
-    args = parser.parse_args()
+    apply = "--apply" in sys.argv
+    include_all = "--include-all" in sys.argv
 
-    state = load_state(STATE_PATH)
+    cfg = load_config()
+    cal_id = cfg["google_calendar_id"]
     service = get_google_service()
 
-    events = fetch_all_events(service)
-    dup_info = analyze_duplicates(events, state)
-    delete_duplicates(service, dup_info, apply=args.apply)
+    log.info("=" * 60)
+    log.info(f"Duplicate cleanup starting for calendar {cal_id}")
+    log.info(f"Apply mode: {'YES (will delete)' if apply else 'NO (dry-run only)'}")
+    log.info(f"Include-all mode: {'YES (delete all extras per group)' if include_all else 'NO (CalendarBridge events only)'}")
+
+    events = fetch_events(service, cal_id, cfg)
+    dup_groups = group_duplicates(events)
+
+    report = {
+        "apply": apply,
+        "include_all": include_all,
+        "total_groups": len(dup_groups),
+        "groups": [],
+    }
+
+    total_safe = 0
+    total_deleted = 0
+
+    for key, group in dup_groups.items():
+        uid, start_key, end_key, summary = key
+        keep, candidates = pick_keep_and_delete(group)
+
+        if include_all:
+            safe_deletes = list(candidates)  # delete all extras
+            unsafe = []
+        else:
+            safe_deletes = [ev for ev in candidates if is_our_event(ev)]
+            unsafe = [ev for ev in candidates if not is_our_event(ev)]
+
+        group_entry = {
+            "uid": uid,
+            "summary": summary,
+            "start": start_key,
+            "end": end_key,
+            "keep_id": keep.get("id"),
+            "keep_created": keep.get("created"),
+            "delete_ids_safe": [ev.get("id") for ev in safe_deletes],
+            "delete_ids_unsafe": [ev.get("id") for ev in unsafe],
+        }
+        report["groups"].append(group_entry)
+        total_safe += len(safe_deletes)
+
+        if apply and safe_deletes:
+            for ev in safe_deletes:
+                gid = ev.get("id")
+                if not gid:
+                    continue
+                try:
+                    log.info(f"Deleting duplicate event {gid} (summary='{summary}', uid={uid})")
+                    service.events().delete(calendarId=cal_id, eventId=gid).execute()
+                    total_deleted += 1
+                    time.sleep(0.05)
+                except HttpError as e:
+                    log.error(f"Failed to delete {gid}: {e}")
+
+    with open(REPORT_PATH, "w") as f:
+        json.dump(report, f, indent=2)
+
+    log.info("=" * 60)
+    log.info(f"Duplicate cleanup complete. Safe duplicates identified: {total_safe}")
+    if apply:
+        log.info(f"Deleted: {total_deleted} events")
+    else:
+        log.info("Dry run only; no events were deleted.")
+        log.info(f"Review report at {REPORT_PATH} and re-run with --apply (and optionally --include-all) if satisfied.")
+    log.info("=" * 60)
+
 
 if __name__ == "__main__":
     main()
