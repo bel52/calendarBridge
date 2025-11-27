@@ -553,26 +553,13 @@ def upsert_event(
     if existing:
         gid = existing.get("id")
         
-        # Check if update needed
-        current_summary = existing.get("summary", "")
-        current_location = existing.get("location", "")
-        current_desc = existing.get("description", "")
-        current_start = existing.get("start", {})
-        current_end = existing.get("end", {})
-        current_transparency = existing.get("transparency", "opaque")
-
-        needs_update = (
-            (body.get("summary") or "") != current_summary or
-            (body.get("location") or "") != current_location or
-            (body.get("description") or "") != current_desc or
-            body.get("start") != current_start or
-            body.get("end") != current_end or
-            body.get("transparency", "opaque") != current_transparency
-        )
-
-        if not needs_update:
+        # EFFICIENCY: Check content hash first (no API call needed)
+        stored_hash = state.get_hash(ev.key)
+        if stored_hash == content_hash:
+            # Content unchanged since last sync - skip API call entirely
             return "skipped", gid
-
+        
+        # Content changed - need to update
         log.info(f"Updating event {gid} ({ev.summary[:40]})")
         updated = safe_api_call(
             service.events().patch(calendarId=calendar_id, eventId=gid, body=body),
@@ -655,6 +642,13 @@ def main():
             )
             stats[action] += 1
             processed_google_ids.add(gid)
+            
+            # Log progress every 50 events for long syncs
+            if (stats["created"] + stats["updated"] + stats["skipped"]) % 50 == 0:
+                log.debug(
+                    f"Progress: {stats['created']} created, {stats['updated']} updated, "
+                    f"{stats['skipped']} skipped"
+                )
         except Exception as e:
             stats["failed"] += 1
             log.error(f"Failed to sync event {key}: {e}", exc_info=True)
