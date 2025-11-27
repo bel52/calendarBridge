@@ -38,3 +38,4 @@ sync_state_backup.json
 sync_state.json
 sync_state_backup.json
 .idea/
+outbox/*.ics

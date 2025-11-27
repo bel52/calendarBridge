@@ -1,0 +1,10 @@
+=== CalendarBridge Status Report ===
+Version: 6.1.0
+Generated: Thu Nov 27 16:41:59 EST 2025
+
+Tracked Events: 548
+Disk Usage: 220M
+
+LaunchAgents:
+-	0	net.leathermans.calendarbridge
+-	0	net.leathermans.calendarbridge.maintenance
