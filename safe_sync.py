@@ -127,7 +127,7 @@ class SyncState:
         return self.data.get("events", {}).get(key)
     
     def set_event_hash(self, key: str, content_hash: str, google_id: str):
-        """Store hash and Google ID for an event."""
+        """Store hash and Google ID for a local event key."""
         if "events" not in self.data:
             self.data["events"] = {}
         if "google_ids" not in self.data:
@@ -283,7 +283,10 @@ def get_sync_window() -> Tuple[datetime, datetime]:
     return now - timedelta(days=DAYS_PAST), now + timedelta(days=DAYS_FUTURE)
 
 def load_local_events(outbox_dir: str) -> Dict[str, Dict[str, Any]]:
-    """Parse ICS files and expand recurring events."""
+    """
+    Parse ICS files and expand recurring events.
+    Robust to multi-VCALENDAR files by splitting into segments if needed.
+    """
     events: Dict[str, Dict[str, Any]] = {}
     window_start, window_end = get_sync_window()
     
@@ -299,80 +302,135 @@ def load_local_events(outbox_dir: str) -> Dict[str, Dict[str, Any]]:
         with open(combined_path, "rb") as f:
             raw_data = f.read()
         
-        cal = Calendar.from_ical(raw_data)
-        
-        # Expand recurring events
+        calendars: List[Calendar] = []
+        # First try: parse as single VCALENDAR
         try:
-            expanded = recurring_ical_events.of(cal).between(window_start, window_end)
+            cal = Calendar.from_ical(raw_data)
+            calendars.append(cal)
         except Exception as e:
-            log.warning(f"Recurrence expansion failed: {e}, falling back to simple parse")
-            expanded = list(cal.walk("VEVENT"))
-        
-        for comp in expanded:
-            try:
-                if comp.name != "VEVENT":
-                    continue
-                
-                uid = str(comp.get("UID") or "").strip()
-                if not uid:
-                    continue
-                
-                dtstart_prop = comp.get("DTSTART")
-                dtend_prop = comp.get("DTEND")
-                if not dtstart_prop:
-                    continue
-                
-                dtstart = dtstart_prop.dt
-                dtend = dtend_prop.dt if dtend_prop else None
-                
-                # Track recurring
-                if comp.get("RRULE") or comp.get("RECURRENCE-ID"):
-                    stats["recurring"] += 1
-                
-                all_day = is_all_day_event(comp)
-                
-                if all_day:
-                    stats["all_day"] += 1
-                    start_date = normalize_to_date(dtstart)
-                    end_date = normalize_to_date(dtend) if dtend else start_date + timedelta(days=1)
-                    if end_date <= start_date:
-                        end_date = start_date + timedelta(days=1)
-                    
-                    key = f"{uid}|{start_date.isoformat()}"
-                    events[key] = {
-                        "uid": uid,
-                        "summary": (comp.get("SUMMARY") or "").strip(),
-                        "location": (comp.get("LOCATION") or "").strip(),
-                        "description": (comp.get("DESCRIPTION") or "").strip(),
-                        "start": start_date,
-                        "end": end_date,
-                        "allDay": True
-                    }
+            msg = str(e).lower()
+            # If this looks like a multi-component / multi-VCALENDAR file, split and parse segments
+            if b"BEGIN:VCALENDAR" in raw_data or "multiple components" in msg or "where only one is allowed" in msg:
+                parts = raw_data.split(b"BEGIN:VCALENDAR")
+                for part in parts:
+                    if not part.strip():
+                        continue
+                    segment = b"BEGIN:VCALENDAR" + part
+                    try:
+                        c = Calendar.from_ical(segment)
+                        calendars.append(c)
+                    except Exception as e2:
+                        stats["errors"] += 1
+                        log.warning(f"Skipping malformed VCALENDAR segment: {e2}")
+                if not calendars:
+                    log.error(f"Failed to parse ICS file (all segments invalid): {e}")
+                    return events
                 else:
-                    stats["timed"] += 1
-                    if dtend is None:
-                        dtend = dtstart + timedelta(hours=1) if isinstance(dtstart, datetime) else dtstart + timedelta(days=1)
-                    
-                    key = f"{uid}|{to_iso(dtstart)}"
-                    events[key] = {
-                        "uid": uid,
-                        "summary": (comp.get("SUMMARY") or "").strip(),
-                        "location": (comp.get("LOCATION") or "").strip(),
-                        "description": (comp.get("DESCRIPTION") or "").strip(),
-                        "start": dtstart,
-                        "end": dtend,
-                        "allDay": False
-                    }
+                    log.info(f"Parsed ICS as {len(calendars)} VCALENDAR segments (multi-component file).")
+            else:
+                log.error(f"Failed to parse ICS file: {e}")
+                return events
+        
+        # Process each calendar segment
+        for cal in calendars:
+            try:
+                try:
+                    expanded = recurring_ical_events.of(cal).between(window_start, window_end)
+                except Exception as e:
+                    log.warning(f"Recurrence expansion failed for one segment: {e}, falling back to simple VEVENT walk")
+                    expanded = list(cal.walk("VEVENT"))
+                
             except Exception as e:
                 stats["errors"] += 1
-                log.debug(f"Error parsing event: {e}")
+                log.warning(f"Failed to process calendar segment: {e}")
                 continue
+            
+            for comp in expanded:
+                try:
+                    # When using recurring_ical_events, items are VEVENTs already,
+                    # but this check is cheap and safe.
+                    if getattr(comp, "name", "").upper() != "VEVENT":
+                        continue
+                    
+                    uid = str(comp.get("UID") or "").strip()
+                    if not uid:
+                        continue
+                    
+                    dtstart_prop = comp.get("DTSTART")
+                    dtend_prop = comp.get("DTEND")
+                    if not dtstart_prop:
+                        continue
+                    
+                    dtstart = dtstart_prop.dt
+                    dtend = dtend_prop.dt if dtend_prop else None
+                    
+                    # Track recurring
+                    if comp.get("RRULE") or comp.get("RECURRENCE-ID"):
+                        stats["recurring"] += 1
+                    
+                    all_day = is_all_day_event(comp)
+                    
+                    if all_day:
+                        stats["all_day"] += 1
+                        start_date = normalize_to_date(dtstart)
+                        end_date = normalize_to_date(dtend) if dtend else start_date + timedelta(days=1)
+                        if end_date <= start_date:
+                            end_date = start_date + timedelta(days=1)
+                        
+                        key = f"{uid}|{start_date.isoformat()}"
+                        events[key] = {
+                            "uid": uid,
+                            "summary": (comp.get("SUMMARY") or "").strip(),
+                            "location": (comp.get("LOCATION") or "").strip(),
+                            "description": (comp.get("DESCRIPTION") or "").strip(),
+                            "start": start_date,
+                            "end": end_date,
+                            "allDay": True
+                        }
+                    else:
+                        stats["timed"] += 1
+                        if dtend is None:
+                            if isinstance(dtstart, datetime):
+                                dtend = dtstart + timedelta(hours=1)
+                            else:
+                                dtend = dtstart + timedelta(days=1)
+                        
+                        # IMPORTANT: key must match fetch_google_events logic
+                        iso = to_iso(dtstart)
+                        if "T" in iso:
+                            parts = iso.split("T")
+                            rest = parts[1]
+                            time_part = rest[:8] if len(rest) >= 8 else rest.split("+")[0].split("-")[0]
+                            start_str = f"{parts[0]}T{time_part}"
+                        else:
+                            start_str = iso
+                        
+                        key = f"{uid}|{start_str}"
+                        events[key] = {
+                            "uid": uid,
+                            "summary": (comp.get("SUMMARY") or "").strip(),
+                            "location": (comp.get("LOCATION") or "").strip(),
+                            "description": (comp.get("DESCRIPTION") or "").strip(),
+                            "start": dtstart,
+                            "end": dtend,
+                            "allDay": False
+                        }
+                except Exception as e:
+                    stats["errors"] += 1
+                    log.debug(f"Error parsing event: {e}")
+                    continue
     
     except Exception as e:
         log.error(f"Failed to parse ICS file: {e}")
         return events
     
-    log.info(f"Parsed {len(events)} events: {stats['all_day']} all-day, {stats['timed']} timed, {stats['recurring']} recurring instances, {stats['errors']} errors")
+    log.info(
+        f"Parsed {len(events)} events: "
+        f"{stats['all_day']} all-day, "
+        f"{stats['timed']} timed, "
+        f"{stats['recurring']} recurring instances, "
+        f"{stats['errors']} errors"
+    )
     return events
 
 # ---------------- Google Event Operations ----------------
