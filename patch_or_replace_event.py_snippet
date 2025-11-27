@@ -1,0 +1,67 @@
+def patch_or_replace_event(service, calendar_id, google_event_id, body, uid, logger):
+    """
+    Try to PATCH an event. If Google returns 400 Invalid start time,
+    delete the bad event and INSERT a clean one instead.
+    """
+    from googleapiclient.errors import HttpError
+
+    try:
+        return service.events().patch(
+            calendarId=calendar_id,
+            eventId=google_event_id,
+            body=body,
+            sendUpdates='none'
+        ).execute()
+
+    except HttpError as e:
+        msg = str(e)
+        status = getattr(e.resp, "status", None)
+
+        # Only special-case 400 Invalid start time
+        if status == 400 and 'Invalid start time' in msg:
+            logger.warning(
+                "[warn] patch invalid start for uid=%s (eventId=%s), doing delete+insert once",
+                uid, google_event_id,
+            )
+
+            # 1) Try to delete the existing broken event
+            try:
+                service.events().delete(
+                    calendarId=calendar_id,
+                    eventId=google_event_id,
+                    sendUpdates='none'
+                ).execute()
+            except HttpError as de:
+                logger.error(
+                    "[error] delete failed for uid=%s eventId=%s: %s",
+                    uid, google_event_id, de
+                )
+                # Give up on this event; don't loop
+                return None
+
+            # 2) Insert a clean event using the desired body
+            try:
+                inserted = service.events().insert(
+                    calendarId=calendar_id,
+                    body=body,
+                    sendUpdates='none'
+                ).execute()
+                logger.info(
+                    "[info] replaced event for uid=%s with new id=%s",
+                    uid, inserted.get("id")
+                )
+                return inserted
+            except HttpError as ie:
+                logger.error(
+                    "[error] insert failed for uid=%s after delete: %s",
+                    uid, ie
+                )
+                # Give up; don't loop
+                return None
+
+        # Any other error: just log and bail
+        logger.error(
+            "[error] events.patch uid=%s failed with status=%s: %s",
+            uid, status, msg
+        )
+        return None
