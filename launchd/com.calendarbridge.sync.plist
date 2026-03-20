@@ -5,28 +5,27 @@
   <key>Label</key>
   <string>com.calendarbridge.sync</string>
 
-  <!-- Use the wrapper so we only run when Outlook is actually up -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>/Users/bel/calendarBridge/run_sync_wrapper.sh</string>
+    <string>$HOME/calendarBridge/full_sync.sh</string>
   </array>
 
-  <!-- Run approximately every 30 minutes -->
+  <!-- Run every 30 minutes -->
   <key>StartInterval</key>
   <integer>1800</integer>
 
-  <!-- Also run once right after login/load -->
+  <!-- Run once on login -->
   <key>RunAtLoad</key>
   <true/>
 
-  <!-- LaunchAgent logs (in addition to wrapper logs) -->
   <key>StandardOutPath</key>
-  <string>/Users/bel/calendarBridge/logs/launchd.stdout.log</string>
+  <string>/tmp/calendarbridge.stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/bel/calendarBridge/logs/launchd.stderr.log</string>
+  <string>/tmp/calendarbridge.stderr.log</string>
 
+  <!-- Only run in GUI sessions -->
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
   <key>AbandonProcessGroup</key>

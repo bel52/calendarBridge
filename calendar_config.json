@@ -6,8 +6,6 @@
   "sync_days_future": 90,
   "api_delay_seconds": 1.05,
   "timezone": "America/New_York",
-  "enable_batch_operations": false,
-  "batch_size": 20,
-  "enable_health_monitoring": true,
-  "enable_state_tracking": true
+  "max_ics_age_hours": 2.0,
+  "enable_notifications": true
 }

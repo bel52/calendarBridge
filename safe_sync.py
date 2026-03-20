@@ -2,24 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 CalendarBridge Safe Sync - Outlook → Google Calendar
-Version 6.1.0 - Production Release
+Version 7.0.0
 
-Features:
-- Multi-VCALENDAR block support for Outlook exports
-- Deterministic key per event instance: UID|normalized start
-- Fixed timezone key matching to prevent duplicates
-- Idempotent: no duplicate creation for the same UID/start
-- Conservative deletion (only events we created)
-- All-day vs timed event handling for proper iOS display
-- Recurring expansion within sync window
+Changes from 6.1.0:
+- Atomic state file writes (crash-safe)
+- ICS staleness guard (configurable max age)
+- Exponential backoff on rate limits (429/5xx)
+- Config validation on startup
+- macOS notification on failure
+- Streamlined logging (single log target)
+- Improved error handling throughout
 """
 
 import os
 import sys
 import json
 import time
+import shutil
 import logging
 import hashlib
+import tempfile
+import subprocess
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, Union, List
 from datetime import datetime, date, timedelta, timezone
@@ -50,21 +53,43 @@ CREDENTIALS_PATH = os.path.join(ROOT, "credentials.json")
 LOG_DIR = os.path.join(ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-LOG_PATH = os.path.join(LOG_DIR, "safe_sync.log")
+ORPHAN_MARKER = "CalendarBridge"
+VERSION = "7.0.0"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+# Backoff settings
+MAX_RETRIES = 5
+INITIAL_BACKOFF_SECONDS = 2.0
+MAX_BACKOFF_SECONDS = 60.0
+
+# ============================================================================
+# Logging — single handler, configured by caller (full_sync.sh) or standalone
+# ============================================================================
 
 log = logging.getLogger("calendarbridge")
 
-ORPHAN_MARKER = "CalendarBridge"
-VERSION = "6.1.0"
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    _sh = logging.StreamHandler(sys.stdout)
+    _sh.setFormatter(_fmt)
+    log.addHandler(_sh)
+
+
+# ============================================================================
+# macOS Notifications
+# ============================================================================
+
+def notify(title: str, message: str):
+    """Send macOS notification. Fails silently if not on macOS."""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{message}" with title "{title}"'],
+            timeout=5, capture_output=True,
+        )
+    except Exception:
+        pass
+
 
 # ============================================================================
 # Data Models
@@ -83,31 +108,91 @@ class LocalEvent:
 
 
 # ============================================================================
-# Configuration & Authentication
+# Configuration & Validation
 # ============================================================================
+
+_CONFIG_SCHEMA = {
+    "google_calendar_id": {"type": str, "required": True},
+    "timezone": {"type": str, "required": True},
+    "sync_days_past": {"type": int, "required": True, "min": 1, "max": 365},
+    "sync_days_future": {"type": int, "required": True, "min": 1, "max": 365},
+    "outlook_calendar_name": {"type": str, "required": False, "default": "Calendar"},
+    "outlook_calendar_index": {"type": int, "required": False, "default": 2},
+    "api_delay_seconds": {"type": float, "required": False, "default": 1.05},
+    "max_ics_age_hours": {"type": float, "required": False, "default": 2.0},
+    "enable_notifications": {"type": bool, "required": False, "default": True},
+}
+
 
 def load_config() -> Dict[str, Any]:
     if not os.path.exists(CONFIG_PATH):
         raise SystemExit(f"Missing config file: {CONFIG_PATH}")
+
     with open(CONFIG_PATH, "r") as f:
-        cfg = json.load(f)
-    required = ["google_calendar_id", "timezone", "sync_days_past", "sync_days_future"]
-    missing = [k for k in required if k not in cfg]
-    if missing:
-        raise SystemExit(f"Missing config keys: {missing}")
+        try:
+            cfg = json.load(f)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"Invalid JSON in {CONFIG_PATH}: {e}")
+
+    errors = []
+    for key, spec in _CONFIG_SCHEMA.items():
+        if key not in cfg:
+            if spec["required"]:
+                errors.append(f"Missing required key: '{key}'")
+            else:
+                cfg[key] = spec.get("default")
+            continue
+
+        val = cfg[key]
+        expected_type = spec["type"]
+
+        # Allow int where float is expected
+        if expected_type is float and isinstance(val, int):
+            val = float(val)
+            cfg[key] = val
+
+        if not isinstance(val, expected_type):
+            errors.append(
+                f"'{key}' must be {expected_type.__name__}, got {type(val).__name__}"
+            )
+            continue
+
+        if "min" in spec and val < spec["min"]:
+            errors.append(f"'{key}' must be >= {spec['min']}, got {val}")
+        if "max" in spec and val > spec["max"]:
+            errors.append(f"'{key}' must be <= {spec['max']}, got {val}")
+
+    if errors:
+        raise SystemExit(
+            "Config validation errors:\n  " + "\n  ".join(errors)
+        )
+
+    # Validate timezone is real
+    try:
+        ZoneInfo(cfg["timezone"])
+    except Exception:
+        raise SystemExit(f"Invalid timezone: '{cfg['timezone']}'")
+
     return cfg
 
 
 def get_timezone(tz_name: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(tz_name)
-    except Exception as e:
-        raise SystemExit(f"Invalid timezone '{tz_name}': {e}")
+    return ZoneInfo(tz_name)
 
+
+# ============================================================================
+# Authentication
+# ============================================================================
 
 def get_google_service(scopes: Optional[List[str]] = None):
     if scopes is None:
         scopes = ["https://www.googleapis.com/auth/calendar"]
+
+    if not os.path.exists(CREDENTIALS_PATH):
+        raise SystemExit(
+            f"Missing {CREDENTIALS_PATH} — copy your Google OAuth credentials file here."
+        )
+
     creds = None
     if os.path.exists(TOKEN_PATH):
         try:
@@ -125,7 +210,9 @@ def get_google_service(scopes: Optional[List[str]] = None):
                 creds = None
 
         if not creds:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, scopes)
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CREDENTIALS_PATH, scopes
+            )
             creds = flow.run_local_server(port=0)
 
         with open(TOKEN_PATH, "w") as token:
@@ -135,31 +222,62 @@ def get_google_service(scopes: Optional[List[str]] = None):
 
 
 # ============================================================================
-# State Management
+# State Management — Atomic Writes
 # ============================================================================
 
 class SyncState:
+    """
+    Tracks synced events with crash-safe persistence.
+    Writes go to a temp file first, then atomic rename.
+    """
+
     def __init__(self, path: str):
         self.path = path
         self.data = {"events": {}, "google_ids": {}, "last_sync": None}
         self._load()
 
     def _load(self):
-        if os.path.exists(self.path):
+        if not os.path.exists(self.path):
+            return
+
+        try:
+            with open(self.path, "r") as f:
+                loaded = json.load(f)
+            # Basic structure validation
+            if isinstance(loaded, dict) and "events" in loaded:
+                self.data = loaded
+            else:
+                log.warning("State file has unexpected structure, starting fresh")
+        except (json.JSONDecodeError, IOError) as e:
+            log.warning(f"Corrupt state file, starting fresh: {e}")
+            # Back up the corrupt file for diagnosis
+            backup = self.path + ".corrupt"
             try:
-                with open(self.path, "r") as f:
-                    self.data = json.load(f)
-            except Exception as e:
-                log.warning(f"Failed to load state file, starting fresh: {e}")
-                self.data = {"events": {}, "google_ids": {}, "last_sync": None}
+                shutil.copy2(self.path, backup)
+                log.info(f"Backed up corrupt state to {backup}")
+            except Exception:
+                pass
 
     def save(self):
+        """Atomic write: temp file → rename. Safe against crashes."""
+        self.data["last_sync"] = datetime.now(timezone.utc).isoformat()
         try:
-            self.data["last_sync"] = datetime.now(timezone.utc).isoformat()
-            with open(self.path, "w") as f:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(self.path) or ".",
+                prefix=".sync_state_",
+                suffix=".tmp",
+            )
+            with os.fdopen(fd, "w") as f:
                 json.dump(self.data, f, indent=2)
+            os.replace(tmp_path, self.path)  # atomic on POSIX
         except Exception as e:
             log.error(f"Failed to save state: {e}")
+            # Clean up temp file if rename failed
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
 
     def get_hash(self, key: str) -> Optional[str]:
         return self.data.get("events", {}).get(key)
@@ -180,7 +298,9 @@ class SyncState:
 # Time Utilities
 # ============================================================================
 
-def get_sync_window(cfg: Dict[str, Any], tz: ZoneInfo) -> Tuple[datetime, datetime]:
+def get_sync_window(
+    cfg: Dict[str, Any], tz: ZoneInfo
+) -> Tuple[datetime, datetime]:
     now = datetime.now(tz)
     start = now - timedelta(days=int(cfg["sync_days_past"]))
     end = now + timedelta(days=int(cfg["sync_days_future"]))
@@ -197,7 +317,9 @@ def normalize_to_date(dt_or_date: Union[datetime, date], tz: ZoneInfo) -> date:
     raise TypeError(f"Unsupported type: {type(dt_or_date)}")
 
 
-def normalize_to_datetime(dt: Union[datetime, date], tz: ZoneInfo) -> datetime:
+def normalize_to_datetime(
+    dt: Union[datetime, date], tz: ZoneInfo
+) -> datetime:
     if isinstance(dt, datetime):
         if dt.tzinfo is None:
             return dt.replace(tzinfo=tz)
@@ -208,7 +330,7 @@ def normalize_to_datetime(dt: Union[datetime, date], tz: ZoneInfo) -> datetime:
 
 
 def is_all_day_event(comp) -> bool:
-    """Detect all-day events using multiple heuristics"""
+    """Detect all-day events using multiple heuristics."""
     ms_allday = comp.get("X-MICROSOFT-CDO-ALLDAYEVENT")
     if ms_allday and str(ms_allday).strip().upper() == "TRUE":
         return True
@@ -225,24 +347,33 @@ def is_all_day_event(comp) -> bool:
     if isinstance(dtstart, datetime) and dtend_prop is not None:
         dtend = dtend_prop.dt
         if isinstance(dtend, datetime):
-            start_midnight = dtstart.hour == 0 and dtstart.minute == 0 and dtstart.second == 0
-            end_midnight = dtend.hour == 0 and dtend.minute == 0 and dtend.second == 0
+            start_midnight = (
+                dtstart.hour == 0
+                and dtstart.minute == 0
+                and dtstart.second == 0
+            )
+            end_midnight = (
+                dtend.hour == 0 and dtend.minute == 0 and dtend.second == 0
+            )
             if start_midnight and end_midnight and dtend > dtstart:
                 delta = dtend - dtstart
                 if delta.days >= 1 and delta.seconds == 0:
                     return True
-
     return False
 
 
 def compute_event_hash(ev: LocalEvent, tz: ZoneInfo) -> str:
-    """Generate content hash for change detection"""
+    """Generate content hash for change detection."""
     if ev.all_day:
         start_repr = normalize_to_date(ev.start, tz).isoformat()
         end_repr = normalize_to_date(ev.end, tz).isoformat()
     else:
-        start_repr = normalize_to_datetime(ev.start, tz).isoformat(timespec="seconds")
-        end_repr = normalize_to_datetime(ev.end, tz).isoformat(timespec="seconds")
+        start_repr = normalize_to_datetime(ev.start, tz).isoformat(
+            timespec="seconds"
+        )
+        end_repr = normalize_to_datetime(ev.end, tz).isoformat(
+            timespec="seconds"
+        )
 
     payload = {
         "uid": ev.uid,
@@ -258,53 +389,80 @@ def compute_event_hash(ev: LocalEvent, tz: ZoneInfo) -> str:
 
 
 def to_iso(dt: datetime) -> str:
-    """Convert datetime to ISO format in UTC"""
+    """Convert datetime to ISO format in UTC."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
 
 
 # ============================================================================
-# ICS Parsing with Multi-VCALENDAR Support
+# ICS Parsing — with Staleness Guard
 # ============================================================================
 
-def load_local_events(cfg: Dict[str, Any], tz: ZoneInfo) -> Dict[str, LocalEvent]:
+def check_ics_freshness(ics_path: str, max_age_hours: float) -> bool:
     """
-    Parse Outlook ICS export which may contain multiple VCALENDAR blocks.
-    Returns dict keyed by UID|normalized_start_time
+    Verify ICS file exists and isn't stale.
+    Returns True if fresh enough, raises SystemExit if stale.
+    """
+    if not os.path.exists(ics_path):
+        raise SystemExit(f"No ICS file at {ics_path}")
+
+    mtime = os.path.getmtime(ics_path)
+    age_seconds = time.time() - mtime
+    age_hours = age_seconds / 3600
+
+    if age_hours > max_age_hours:
+        age_str = (
+            f"{age_hours:.1f} hours"
+            if age_hours < 24
+            else f"{age_hours / 24:.1f} days"
+        )
+        raise SystemExit(
+            f"ICS file is {age_str} old (max: {max_age_hours}h). "
+            f"Refusing to sync stale data — open Outlook and re-run."
+        )
+
+    log.info(f"ICS file age: {age_hours:.1f}h (max: {max_age_hours}h) — fresh")
+    return True
+
+
+def load_local_events(
+    cfg: Dict[str, Any], tz: ZoneInfo
+) -> Dict[str, LocalEvent]:
+    """
+    Parse Outlook ICS export (may contain multiple VCALENDAR blocks).
+    Returns dict keyed by UID|normalized_start_time.
     """
     outbox_dir = os.path.join(ROOT, "outbox")
     ics_path = os.path.join(outbox_dir, "outlook_full_export.ics")
 
-    if not os.path.exists(ics_path):
-        log.error(f"No ICS found at {ics_path}")
-        return {}
+    # Staleness guard
+    max_age = float(cfg.get("max_ics_age_hours", 2.0))
+    check_ics_freshness(ics_path, max_age)
 
     window_start, window_end = get_sync_window(cfg, tz)
-    log.info(f"Sync window (local time, naive): {window_start} → {window_end}")
+    log.info(f"Sync window: {window_start} → {window_end}")
 
     events: Dict[str, LocalEvent] = {}
     stats = {"all_day": 0, "timed": 0, "recurring": 0, "errors": 0}
 
-    # Read and split by VCALENDAR blocks
     with open(ics_path, "rb") as f:
         raw_data = f.read()
 
     content = raw_data.decode("utf-8", errors="ignore")
-    
+
     # Split into individual VCALENDAR blocks
     blocks = content.split("BEGIN:VCALENDAR")
     vcal_count = 0
-    
+
     for block in blocks:
         if not block.strip():
             continue
-        
-        # Reconstruct valid VCALENDAR
+
         ics_block = "BEGIN:VCALENDAR" + block
         if not ics_block.rstrip().endswith("END:VCALENDAR"):
             ics_block = ics_block.rstrip() + "\nEND:VCALENDAR"
-        
+
         try:
             cal = Calendar.from_ical(ics_block.encode("utf-8"))
             vcal_count += 1
@@ -312,7 +470,6 @@ def load_local_events(cfg: Dict[str, Any], tz: ZoneInfo) -> Dict[str, LocalEvent
             log.debug(f"Skipping invalid VCALENDAR block: {e}")
             continue
 
-        # Expand recurring events
         try:
             expanded = recurring_of(cal).between(window_start, window_end)
         except Exception as e:
@@ -322,7 +479,7 @@ def load_local_events(cfg: Dict[str, Any], tz: ZoneInfo) -> Dict[str, LocalEvent
         for comp in expanded:
             if comp.name != "VEVENT":
                 continue
-            
+
             try:
                 uid = str(comp.get("UID") or "").strip()
                 if not uid:
@@ -344,7 +501,11 @@ def load_local_events(cfg: Dict[str, Any], tz: ZoneInfo) -> Dict[str, LocalEvent
                 if all_day:
                     stats["all_day"] += 1
                     start_date = normalize_to_date(dtstart, tz)
-                    end_date = normalize_to_date(dtend, tz) if dtend else start_date + timedelta(days=1)
+                    end_date = (
+                        normalize_to_date(dtend, tz)
+                        if dtend
+                        else start_date + timedelta(days=1)
+                    )
                     if end_date <= start_date:
                         end_date = start_date + timedelta(days=1)
 
@@ -364,12 +525,12 @@ def load_local_events(cfg: Dict[str, Any], tz: ZoneInfo) -> Dict[str, LocalEvent
                 else:
                     stats["timed"] += 1
                     start_dt = normalize_to_datetime(dtstart, tz)
-                    if dtend is not None:
-                        end_dt = normalize_to_datetime(dtend, tz)
-                    else:
-                        end_dt = start_dt + timedelta(hours=1)
+                    end_dt = (
+                        normalize_to_datetime(dtend, tz)
+                        if dtend is not None
+                        else start_dt + timedelta(hours=1)
+                    )
 
-                    # CRITICAL FIX: Strip timezone to match Google key format
                     start_iso = start_dt.isoformat(timespec="seconds")
                     if "T" in start_iso:
                         date_part, time_part = start_iso.split("T", 1)
@@ -397,19 +558,19 @@ def load_local_events(cfg: Dict[str, Any], tz: ZoneInfo) -> Dict[str, LocalEvent
 
     log.info(f"Parsed {vcal_count} VCALENDAR blocks")
     log.info(
-        f"Parsed {len(events)} events: {stats['all_day']} all-day, "
-        f"{stats['timed']} timed, {stats['recurring']} recurring instances, "
-        f"{stats['errors']} errors"
+        f"Loaded {len(events)} events: {stats['all_day']} all-day, "
+        f"{stats['timed']} timed, {stats['recurring']} recurring, "
+        f"{stats['errors']} parse errors"
     )
     return events
 
 
 # ============================================================================
-# Google Calendar Operations
+# Google Calendar Operations — with Exponential Backoff
 # ============================================================================
 
 def build_event_body(ev: LocalEvent, tz_name: str) -> Dict[str, Any]:
-    """Build Google Calendar API event body"""
+    """Build Google Calendar API event body."""
     body: Dict[str, Any] = {
         "summary": ev.summary or "(No title)",
         "location": ev.location or None,
@@ -423,14 +584,25 @@ def build_event_body(ev: LocalEvent, tz_name: str) -> Dict[str, Any]:
     }
 
     if ev.all_day:
-        start_date = ev.start if isinstance(ev.start, date) else ev.start.date()
+        start_date = (
+            ev.start if isinstance(ev.start, date) else ev.start.date()
+        )
         end_date = ev.end if isinstance(ev.end, date) else ev.end.date()
         body["start"] = {"date": start_date.isoformat()}
         body["end"] = {"date": end_date.isoformat()}
         body["transparency"] = "transparent"
     else:
-        start_dt = ev.start if isinstance(ev.start, datetime) else normalize_to_datetime(ev.start, ZoneInfo(tz_name))
-        end_dt = ev.end if isinstance(ev.end, datetime) else normalize_to_datetime(ev.end, ZoneInfo(tz_name))
+        tz = ZoneInfo(tz_name)
+        start_dt = (
+            ev.start
+            if isinstance(ev.start, datetime)
+            else normalize_to_datetime(ev.start, tz)
+        )
+        end_dt = (
+            ev.end
+            if isinstance(ev.end, datetime)
+            else normalize_to_datetime(ev.end, tz)
+        )
         body["start"] = {"dateTime": to_iso(start_dt), "timeZone": tz_name}
         body["end"] = {"dateTime": to_iso(end_dt), "timeZone": tz_name}
 
@@ -438,7 +610,6 @@ def build_event_body(ev: LocalEvent, tz_name: str) -> Dict[str, Any]:
 
 
 def get_time_window_iso(cfg: Dict[str, Any]) -> Tuple[str, str]:
-    """Get sync window as ISO strings in UTC"""
     now = datetime.now(timezone.utc)
     time_min = now - timedelta(days=int(cfg["sync_days_past"]))
     time_max = now + timedelta(days=int(cfg["sync_days_future"]))
@@ -446,10 +617,6 @@ def get_time_window_iso(cfg: Dict[str, Any]) -> Tuple[str, str]:
 
 
 def _normalize_start_for_key(start: Dict[str, Any]) -> Optional[str]:
-    """
-    Normalize Google event start time to match local key format.
-    Strips timezone and subseconds for consistent comparison.
-    """
     if not start:
         return None
     if "date" in start:
@@ -465,8 +632,61 @@ def _normalize_start_for_key(start: Dict[str, Any]) -> Optional[str]:
     return f"{date_part}T{time_part}"
 
 
-def fetch_google_events(service, calendar_id: str, cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Fetch all Google events in sync window, keyed by UID|start"""
+def safe_api_call(func, label: str, delay: float):
+    """
+    Execute API call with exponential backoff on rate limits and server errors.
+    Retries on 429 (rate limit) and 5xx (server error).
+    """
+    backoff = INITIAL_BACKOFF_SECONDS
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            result = func.execute()
+            if delay > 0:
+                time.sleep(delay)
+            return result
+
+        except HttpError as e:
+            status = e.resp.status if hasattr(e, "resp") else 0
+
+            if status == 429 or status >= 500:
+                if attempt == MAX_RETRIES:
+                    log.error(
+                        f"{label}: failed after {MAX_RETRIES} attempts "
+                        f"(HTTP {status})"
+                    )
+                    raise
+
+                # Check for Retry-After header
+                retry_after = None
+                if hasattr(e, "resp") and "retry-after" in (e.resp or {}):
+                    try:
+                        retry_after = float(e.resp["retry-after"])
+                    except (ValueError, TypeError):
+                        pass
+
+                wait = retry_after if retry_after else backoff
+                wait = min(wait, MAX_BACKOFF_SECONDS)
+
+                log.warning(
+                    f"{label}: HTTP {status}, retrying in {wait:.1f}s "
+                    f"(attempt {attempt}/{MAX_RETRIES})"
+                )
+                time.sleep(wait)
+                backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+            else:
+                # Non-retryable error (4xx other than 429)
+                log.error(f"{label}: HTTP {status}: {e}")
+                raise
+
+    # Should not reach here, but just in case
+    raise RuntimeError(f"{label}: exhausted retries")
+
+
+def fetch_google_events(
+    service, calendar_id: str, cfg: Dict[str, Any]
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch all Google events in sync window, keyed by UID|start."""
     time_min, time_max = get_time_window_iso(cfg)
 
     events_by_key: Dict[str, Dict[str, Any]] = {}
@@ -518,21 +738,8 @@ def fetch_google_events(service, calendar_id: str, cfg: Dict[str, Any]) -> Dict[
 
 
 def is_our_event(item: Dict[str, Any]) -> bool:
-    """Check if event was created by CalendarBridge"""
     ext = (item.get("extendedProperties") or {}).get("private") or {}
     return ext.get("source") == ORPHAN_MARKER
-
-
-def safe_api_call(func, label: str, delay: float):
-    """Execute API call with error handling and rate limiting"""
-    try:
-        result = func.execute()
-        if delay > 0:
-            time.sleep(delay)
-        return result
-    except HttpError as e:
-        log.error(f"{label} failed: {e}")
-        raise
 
 
 # ============================================================================
@@ -549,31 +756,29 @@ def upsert_event(
     content_hash: str,
     api_delay: float,
 ) -> Tuple[str, str]:
-    """Create or update event, return (action, google_id)"""
+    """Create or update event, return (action, google_id)."""
     if existing:
         gid = existing.get("id")
-        
-        # EFFICIENCY: Check content hash first (no API call needed)
+
         stored_hash = state.get_hash(ev.key)
         if stored_hash == content_hash:
-            # Content unchanged since last sync - skip API call entirely
             return "skipped", gid
-        
-        # Content changed - need to update
-        log.info(f"Updating event {gid} ({ev.summary[:40]})")
+
+        log.info(f"Updating: {ev.summary[:50]}")
         updated = safe_api_call(
-            service.events().patch(calendarId=calendar_id, eventId=gid, body=body),
-            "events.patch",
+            service.events().patch(
+                calendarId=calendar_id, eventId=gid, body=body
+            ),
+            f"patch({ev.summary[:30]})",
             api_delay,
         )
         state.set_hash(ev.key, content_hash, gid)
         return "updated", updated["id"]
 
-    # Create new event
-    log.info(f"Creating event: {ev.summary[:40]}")
+    log.info(f"Creating: {ev.summary[:50]}")
     created = safe_api_call(
         service.events().insert(calendarId=calendar_id, body=body),
-        "events.insert",
+        f"insert({ev.summary[:30]})",
         api_delay,
     )
     gid = created["id"]
@@ -581,12 +786,13 @@ def upsert_event(
     return "created", gid
 
 
-def delete_event(service, calendar_id: str, gid: str, api_delay: float):
-    """Delete event from Google Calendar"""
-    log.info(f"Deleting event {gid}")
+def delete_event(
+    service, calendar_id: str, gid: str, summary: str, api_delay: float
+):
+    log.info(f"Deleting: {summary[:50]} ({gid})")
     safe_api_call(
         service.events().delete(calendarId=calendar_id, eventId=gid),
-        "events.delete",
+        f"delete({summary[:30]})",
         api_delay,
     )
 
@@ -596,64 +802,64 @@ def delete_event(service, calendar_id: str, gid: str, api_delay: float):
 # ============================================================================
 
 def main():
+    start_time = time.time()
     cfg = load_config()
     tz = get_timezone(cfg["timezone"])
     cal_id = cfg["google_calendar_id"]
-    api_delay = float(cfg.get("api_delay_seconds", 0.05))
+    api_delay = float(cfg.get("api_delay_seconds", 1.05))
+    enable_notify = cfg.get("enable_notifications", True)
 
     log.info("=" * 60)
-    log.info(f"CalendarBridge Safe Sync v{VERSION}")
-    log.info(f"Calendar ID: {cal_id}")
-    log.info(f"Timezone: {cfg['timezone']}")
+    log.info(f"CalendarBridge v{VERSION}")
+    log.info(f"Calendar: {cal_id} | TZ: {cfg['timezone']}")
+    log.info(f"Window: -{cfg['sync_days_past']}d / +{cfg['sync_days_future']}d")
     log.info("=" * 60)
 
     state = SyncState(STATE_PATH)
     service = get_google_service()
 
-    # Parse local events
+    # Parse local events (includes staleness check)
     local_events = load_local_events(cfg, tz)
     if not local_events:
-        log.error("No local events parsed; aborting to avoid destructive sync")
+        log.error("No local events parsed; aborting to prevent destructive sync")
         raise SystemExit(1)
 
     # Fetch Google events
     google_events = fetch_google_events(service, cal_id, cfg)
 
-    stats = {"created": 0, "updated": 0, "skipped": 0, "deleted": 0, "failed": 0}
+    stats = {
+        "created": 0,
+        "updated": 0,
+        "skipped": 0,
+        "deleted": 0,
+        "failed": 0,
+    }
     processed_google_ids = set()
-    start_time = time.time()
 
     # Upsert local → Google
-    for key, ev in local_events.items():
+    total_local = len(local_events)
+    for i, (key, ev) in enumerate(local_events.items(), 1):
         try:
             body = build_event_body(ev, cfg["timezone"])
             content_hash = compute_event_hash(ev, tz)
 
             existing = google_events.get(key)
             action, gid = upsert_event(
-                service,
-                cal_id,
-                ev,
-                body,
-                existing,
-                state,
-                content_hash,
-                api_delay,
+                service, cal_id, ev, body, existing, state,
+                content_hash, api_delay,
             )
             stats[action] += 1
             processed_google_ids.add(gid)
-            
-            # Log progress every 50 events for long syncs
-            if (stats["created"] + stats["updated"] + stats["skipped"]) % 50 == 0:
-                log.debug(
-                    f"Progress: {stats['created']} created, {stats['updated']} updated, "
-                    f"{stats['skipped']} skipped"
-                )
+
+            # Progress logging every 100 events
+            if i % 100 == 0:
+                log.info(f"Progress: {i}/{total_local} processed")
+
         except Exception as e:
             stats["failed"] += 1
-            log.error(f"Failed to sync event {key}: {e}", exc_info=True)
+            log.error(f"Failed to sync '{ev.summary[:40]}': {e}")
 
-    # Delete orphaned events (in Google but not in local)
+    # Delete orphaned events
     local_keys = set(local_events.keys())
     for key, item in google_events.items():
         if key in local_keys:
@@ -664,27 +870,43 @@ def main():
         if not gid or gid in processed_google_ids:
             continue
         try:
-            delete_event(service, cal_id, gid, api_delay)
+            summary = item.get("summary", "(no title)")
+            delete_event(service, cal_id, gid, summary, api_delay)
             stats["deleted"] += 1
             state.remove(key)
         except Exception as e:
             stats["failed"] += 1
-            log.error(f"Failed to delete event {gid}: {e}", exc_info=True)
+            log.error(f"Failed to delete {gid}: {e}")
 
+    # Save state (atomic)
     state.save()
 
     elapsed = time.time() - start_time
     log.info("=" * 60)
     log.info(f"SYNC COMPLETE in {elapsed:.1f}s")
     log.info(
-        f"Created: {stats['created']}, Updated: {stats['updated']}, "
-        f"Skipped: {stats['skipped']}, Deleted: {stats['deleted']}, "
+        f"Created: {stats['created']}  Updated: {stats['updated']}  "
+        f"Skipped: {stats['skipped']}  Deleted: {stats['deleted']}  "
         f"Failed: {stats['failed']}"
     )
     log.info("=" * 60)
 
     if stats["failed"] > 0:
+        msg = f"{stats['failed']} event(s) failed to sync"
+        log.error(msg)
+        if enable_notify:
+            notify("CalendarBridge", msg)
         raise SystemExit(1)
+
+    if enable_notify and (stats["created"] > 0 or stats["deleted"] > 0):
+        changes = []
+        if stats["created"]:
+            changes.append(f"{stats['created']} added")
+        if stats["deleted"]:
+            changes.append(f"{stats['deleted']} removed")
+        if stats["updated"]:
+            changes.append(f"{stats['updated']} updated")
+        notify("CalendarBridge", ", ".join(changes))
 
 
 if __name__ == "__main__":
