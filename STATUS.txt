@@ -1,10 +1,14 @@
 === CalendarBridge Status Report ===
-Version: 6.1.0
-Generated: Thu Nov 27 16:41:59 EST 2025
+Version: 7.0.0
+Deployed: 2026-03-20
 
-Tracked Events: 548
-Disk Usage: 220M
+Features:
+- Atomic state writes (crash-safe)
+- ICS staleness guard (2h max)
+- Exponential backoff on rate limits
+- Config validation on startup
+- macOS failure notifications
+- Pinned dependency versions
 
-LaunchAgents:
--	0	net.leathermans.calendarbridge
--	0	net.leathermans.calendarbridge.maintenance
+LaunchAgent: com.calendarbridge.sync (every 30 min)
+Requires: Outlook Legacy mode
