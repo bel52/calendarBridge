@@ -28,6 +28,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Tuple, List, Optional
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -108,7 +113,7 @@ def get_time_window_iso(cfg: Dict[str, Any]) -> Tuple[str, str]:
 
 # ------------- Helpers -------------
 
-def _normalize_start(start: Dict[str, Any]) -> Optional[str]:
+def _normalize_start(start: Dict[str, Any], tz: Optional[ZoneInfo] = None) -> Optional[str]:
     if not start:
         return None
     if "date" in start:
@@ -116,15 +121,21 @@ def _normalize_start(start: Dict[str, Any]) -> Optional[str]:
     dt_str = start.get("dateTime")
     if not dt_str:
         return None
-    if "T" not in dt_str:
-        return dt_str
-    date_part, time_part = dt_str.split("T", 1)
-    time_part = time_part.split("+")[0].split("-")[0]
-    time_part = time_part[:8]
-    return f"{date_part}T{time_part}"
+    try:
+        parsed = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        if tz and parsed.tzinfo is not None:
+            parsed = parsed.astimezone(tz)
+        return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, AttributeError):
+        if "T" not in dt_str:
+            return dt_str
+        date_part, time_part = dt_str.split("T", 1)
+        time_part = time_part.split("+")[0].split("-")[0]
+        time_part = time_part[:8]
+        return f"{date_part}T{time_part}"
 
 
-def _normalize_end(end: Dict[str, Any]) -> Optional[str]:
+def _normalize_end(end: Dict[str, Any], tz: Optional[ZoneInfo] = None) -> Optional[str]:
     if not end:
         return None
     if "date" in end:
@@ -132,12 +143,18 @@ def _normalize_end(end: Dict[str, Any]) -> Optional[str]:
     dt_str = end.get("dateTime")
     if not dt_str:
         return None
-    if "T" not in dt_str:
-        return dt_str
-    date_part, time_part = dt_str.split("T", 1)
-    time_part = time_part.split("+")[0].split("-")[0]
-    time_part = time_part[:8]
-    return f"{date_part}T{time_part}"
+    try:
+        parsed = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        if tz and parsed.tzinfo is not None:
+            parsed = parsed.astimezone(tz)
+        return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, AttributeError):
+        if "T" not in dt_str:
+            return dt_str
+        date_part, time_part = dt_str.split("T", 1)
+        time_part = time_part.split("+")[0].split("-")[0]
+        time_part = time_part[:8]
+        return f"{date_part}T{time_part}"
 
 
 def is_our_event(ev: Dict[str, Any]) -> bool:
@@ -197,13 +214,20 @@ def group_duplicates(events: List[Dict[str, Any]]) -> Dict[Tuple[str, str, str, 
     """
     groups: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
 
+    # Load config timezone for consistent normalization
+    try:
+        cfg = load_config()
+        tz = ZoneInfo(cfg.get("timezone", "America/New_York"))
+    except Exception:
+        tz = None
+
     for ev in events:
         uid = get_uid(ev)
         if not uid:
             continue
 
-        start_key = _normalize_start(ev.get("start") or {})
-        end_key = _normalize_end(ev.get("end") or {})
+        start_key = _normalize_start(ev.get("start") or {}, tz)
+        end_key = _normalize_end(ev.get("end") or {}, tz)
         if not start_key or not end_key:
             continue
 
@@ -298,7 +322,7 @@ def main():
                     log.info(f"Deleting duplicate event {gid} (summary='{summary}', uid={uid})")
                     service.events().delete(calendarId=cal_id, eventId=gid).execute()
                     total_deleted += 1
-                    time.sleep(0.05)
+                    time.sleep(0.25)  # Stay under Google's 500 req/100s quota
                 except HttpError as e:
                     log.error(f"Failed to delete {gid}: {e}")
 

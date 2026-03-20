@@ -631,7 +631,7 @@ def _normalize_start_for_key(start: Dict[str, Any], tz: Optional[ZoneInfo] = Non
         return None
     # Parse with timezone offset and convert to config tz
     try:
-        parsed = datetime.fromisoformat(dt_str)
+        parsed = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
         if tz and parsed.tzinfo is not None:
             parsed = parsed.astimezone(tz)
         return parsed.strftime("%Y-%m-%dT%H:%M:%S")
