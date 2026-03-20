@@ -616,7 +616,12 @@ def get_time_window_iso(cfg: Dict[str, Any]) -> Tuple[str, str]:
     return time_min.isoformat(), time_max.isoformat()
 
 
-def _normalize_start_for_key(start: Dict[str, Any]) -> Optional[str]:
+def _normalize_start_for_key(start: Dict[str, Any], tz: Optional[ZoneInfo] = None) -> Optional[str]:
+    """
+    Normalize Google event start time to match local key format.
+    Converts to config timezone so keys match regardless of where
+    the API returns times from.
+    """
     if not start:
         return None
     if "date" in start:
@@ -624,12 +629,20 @@ def _normalize_start_for_key(start: Dict[str, Any]) -> Optional[str]:
     dt_str = start.get("dateTime")
     if not dt_str:
         return None
-    if "T" not in dt_str:
-        return dt_str
-    date_part, time_part = dt_str.split("T", 1)
-    time_part = time_part.split("+")[0].split("-")[0]
-    time_part = time_part[:8]
-    return f"{date_part}T{time_part}"
+    # Parse with timezone offset and convert to config tz
+    try:
+        parsed = datetime.fromisoformat(dt_str)
+        if tz and parsed.tzinfo is not None:
+            parsed = parsed.astimezone(tz)
+        return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, AttributeError):
+        # Fallback: strip timezone manually (legacy behavior)
+        if "T" not in dt_str:
+            return dt_str
+        date_part, time_part = dt_str.split("T", 1)
+        time_part = time_part.split("+")[0].split("-")[0]
+        time_part = time_part[:8]
+        return f"{date_part}T{time_part}"
 
 
 def safe_api_call(func, label: str, delay: float):
@@ -684,7 +697,7 @@ def safe_api_call(func, label: str, delay: float):
 
 
 def fetch_google_events(
-    service, calendar_id: str, cfg: Dict[str, Any]
+    service, calendar_id: str, cfg: Dict[str, Any], tz: Optional[ZoneInfo] = None
 ) -> Dict[str, Dict[str, Any]]:
     """Fetch all Google events in sync window, keyed by UID|start."""
     time_min, time_max = get_time_window_iso(cfg)
@@ -722,7 +735,7 @@ def fetch_google_events(
             if not ical_uid:
                 continue
 
-            start_key = _normalize_start_for_key(item.get("start") or {})
+            start_key = _normalize_start_for_key(item.get("start") or {}, tz)
             if not start_key:
                 continue
 
@@ -825,7 +838,7 @@ def main():
         raise SystemExit(1)
 
     # Fetch Google events
-    google_events = fetch_google_events(service, cal_id, cfg)
+    google_events = fetch_google_events(service, cal_id, cfg, tz)
 
     stats = {
         "created": 0,
