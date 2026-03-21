@@ -54,7 +54,7 @@ LOG_DIR = os.path.join(ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 ORPHAN_MARKER = "CalendarBridge"
-VERSION = "7.0.0"
+VERSION = "7.0.1"
 
 # Backoff settings
 MAX_RETRIES = 5

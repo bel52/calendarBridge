@@ -1,5 +1,5 @@
 === CalendarBridge Status Report ===
-Version: 7.0.0
+Version: 7.0.1
 Deployed: 2026-03-20
 
 Features:
@@ -9,6 +9,7 @@ Features:
 - Config validation on startup
 - macOS failure notifications
 - Pinned dependency versions
+- Timezone-safe key matching (works across timezones)
 
 LaunchAgent: com.calendarbridge.sync (every 30 min)
 Requires: Outlook Legacy mode

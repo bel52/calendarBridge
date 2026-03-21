@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# CalendarBridge Maintenance v7.0.0
+# CalendarBridge Maintenance v7.0.1
 # Runs weekly to clean logs, verify health, and backup state.
 # ============================================================================
 set -euo pipefail
@@ -162,7 +162,7 @@ main() {
     fi
 
     log "========================================"
-    log "CalendarBridge Maintenance v7.0.0"
+    log "CalendarBridge Maintenance v7.0.1"
     log "========================================"
 
     cleanup_logs

@@ -43,7 +43,7 @@ if [ -f "${LOCK_FILE}" ]; then
 fi
 echo $$ > "${LOCK_FILE}"
 
-log "========== CalendarBridge v7.0.0 :: ${LOG_TS} =========="
+log "========== CalendarBridge v7.0.1 :: ${LOG_TS} =========="
 
 # ============================================================================
 # Pre-flight checks
