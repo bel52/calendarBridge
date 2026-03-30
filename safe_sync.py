@@ -500,12 +500,19 @@ def load_local_events(
 
                 if all_day:
                     stats["all_day"] += 1
-                    start_date = normalize_to_date(dtstart, tz)
-                    end_date = (
-                        normalize_to_date(dtend, tz)
-                        if dtend
-                        else start_date + timedelta(days=1)
-                    )
+                    # For all-day events, extract date without timezone conversion
+                    # to avoid midnight-UTC shifting to previous day in local tz
+                    if isinstance(dtstart, datetime):
+                        start_date = dtstart.date()
+                    else:
+                        start_date = dtstart
+                    if dtend:
+                        if isinstance(dtend, datetime):
+                            end_date = dtend.date()
+                        else:
+                            end_date = dtend
+                    else:
+                        end_date = start_date + timedelta(days=1)
                     if end_date <= start_date:
                         end_date = start_date + timedelta(days=1)
 
