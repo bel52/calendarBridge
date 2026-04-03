@@ -1,6 +1,6 @@
 === CalendarBridge Status Report ===
-Version: 7.0.1
-Deployed: 2026-03-20
+Version: 7.0.2
+Deployed: 2026-04-03
 
 Features:
 - Atomic state writes (crash-safe)
@@ -10,6 +10,12 @@ Features:
 - macOS failure notifications
 - Pinned dependency versions
 - Timezone-safe key matching (works across timezones)
+- Cron fallback sync (survives LaunchAgent sleep/wake failures)
+- Maintenance auto-recovery (reloads agent + triggers sync when stale >2h)
 
-LaunchAgent: com.calendarbridge.sync (every 30 min)
-Requires: Outlook Legacy mode
+Sync schedule:
+- LaunchAgent: com.calendarbridge.sync (every 30 min)
+- Cron fallback: */30 * * * * full_sync.sh (every 30 min)
+- Maintenance: 0 8 * * * maintenance.sh (daily health check + auto-recovery)
+
+Requires: Outlook Legacy mode (supported until Nov 2026)

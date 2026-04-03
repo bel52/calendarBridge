@@ -1,323 +1,186 @@
-# LeathGuard
+# CalendarBridge (Outlook → Google Calendar)
 
-A modern, self-hosted WireGuard VPN management panel with a beautiful dark-themed UI.
+**Version:** 7.0.2  
+**Repo:** `github.com/bel52/calendarBridge`
 
-![LeathGuard Dashboard](docs/screenshot.png)
+Automated one-way sync from Microsoft Outlook (macOS Legacy mode) to Google Calendar. Runs locally on your Mac — no servers, no cloud dependencies.
 
-## Features
+---
 
-- **Beautiful Dashboard** - Real-time client status, traffic stats, and connection map
-- **Easy Client Management** - Add, edit, revoke clients with QR code generation
-- **Multi-Interface Support** - Manage multiple WireGuard interfaces from one panel
-- **Automatic Updates** - In-app update notifications with one-click updates
-- **Auto-Update Option** - Optional automatic updates via cron (3 AM daily)
-- **Global CLI** - `leathguard` command works from anywhere
-- **Secure by Default** - Session-based auth, CSRF protection, password hashing
+## How It Works
+
+1. AppleScript exports your Outlook calendar to ICS
+2. Python parses ICS and compares against Google Calendar
+3. Creates, updates, or deletes events to keep Google in sync
+4. Tracks state locally to avoid duplicates and detect changes
+
+---
+
+## Key Features
+
+- **Duplicate-safe**: Deterministic UID+start key matching prevents duplicate creation
+- **Multi-VCALENDAR**: Handles complex Outlook exports with multiple calendar blocks
+- **All-day event accuracy**: Proper formatting for iOS banner display
+- **Recurring event expansion**: Syncs all instances within configured time window
+- **Conservative deletion**: Only removes events created by CalendarBridge
+- **Idempotent**: Run as often as needed — no side effects
+- **Crash-safe**: Atomic state file writes via temp+rename
+- **Staleness guard**: Refuses to sync ICS data older than 2 hours (configurable)
+- **Retry with backoff**: Exponential backoff on Google API 429/5xx errors
+- **Timezone-safe**: Key matching works correctly across timezone changes
+- **macOS notifications**: Alerts on sync failures and significant changes
+
+---
+
+## Sync Schedule
+
+CalendarBridge uses three layers to ensure reliability:
+
+| Mechanism | Frequency | Purpose |
+|-----------|-----------|---------|
+| **LaunchAgent** | Every 30 min | Primary sync trigger (`com.calendarbridge.sync`) |
+| **Cron fallback** | Every 30 min | Catches LaunchAgent failures after sleep/wake |
+| **Maintenance cron** | Daily 8 AM | Health check, log cleanup, state backup, auto-recovery |
+
+The LaunchAgent (`StartInterval`) can silently stop firing after macOS sleep/wake cycles. The cron fallback ensures syncs continue regardless. If maintenance detects no sync in 2+ hours, it reloads the agent and triggers a sync automatically.
+
+---
+
+## Prerequisites
+
+- **macOS** with Microsoft Outlook in **Legacy mode**
+- **Python 3.11+**
+- **Google OAuth credentials** (`credentials.json`)
+
+**Important:** New Outlook for Mac does not support AppleScript. You must use Legacy Outlook (supported by Microsoft until November 2026).
+
+---
 
 ## Quick Start
 
-### Prerequisites
-
-- Ubuntu/Debian Linux (tested on Ubuntu 22.04, Debian 12, Raspberry Pi OS)
-- WireGuard installed and configured
-- Python 3.8+
-- Root access
-
-### Installation
+See [DEPLOY.md](DEPLOY.md) for full step-by-step deployment on a new Mac.
 
 ```bash
-# Clone the repository
-git clone https://github.com/bel52/wireguard-panel.git /opt/wg-panel
-cd /opt/wg-panel
-
-# Run installer
-sudo ./install.sh
+cd ~
+git clone https://github.com/bel52/calendarBridge.git
+cd calendarBridge
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+# Add credentials.json, then:
+./full_sync.sh
 ```
 
-The installer will:
-1. Install dependencies (Python, Flask, qrencode)
-2. Set up the `wg-tool` CLI for WireGuard management
-3. Install the `leathguard` global CLI
-4. Create a Python virtual environment
-5. Configure and start the systemd service
-6. Set up firewall rules (if UFW is active)
-
-### First Login
-
-After installation, access the panel at `http://your-server-ip:5000`
-
-Default credentials are set during installation, or you can set them via environment variables:
-- `WG_PANEL_USER` - Username (default: admin)
-- `WG_PANEL_PASS` - Plain text password, OR
-- `WG_PANEL_PASS_HASH` - SHA256 hash of password
-
-## Usage
-
-### Global CLI
-
-LeathGuard installs a global `leathguard` command:
-
-```bash
-# Check status
-leathguard status
-
-# Update to latest version
-sudo leathguard update
-
-# Check for updates without applying
-sudo leathguard check
-
-# View logs
-sudo leathguard logs 50      # Last 50 lines
-sudo leathguard logs -f      # Follow logs
-
-# Service management
-sudo leathguard restart
-sudo leathguard start
-sudo leathguard stop
-
-# Show version
-leathguard version
-```
-
-### WireGuard Client Management (wg-tool)
-
-```bash
-# Add a new client
-sudo wg-tool add clientname [endpoint]
-
-# Show QR code for client
-sudo wg-tool qr clientname
-
-# List all clients
-sudo wg-tool list
-
-# Show live WireGuard status
-sudo wg-tool show
-
-# Revoke a client
-sudo wg-tool revoke clientname
-```
-
-### Web Interface
-
-The web panel provides:
-
-- **Dashboard** - Overview of all clients, traffic, and server health
-- **Client Management** - Add, edit, suspend, and delete clients
-- **QR Codes** - Generate QR codes for mobile clients
-- **Traffic Stats** - Per-client bandwidth usage
-- **Settings** - Change credentials, select interface, enable auto-updates
+---
 
 ## Configuration
 
-### Environment Variables
+**File:** `calendar_config.json`
 
-Set these in `/etc/systemd/system/wg-panel.service`:
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `google_calendar_id` | string | *(required)* | Target Google Calendar ID |
+| `outlook_calendar_name` | string | `Calendar` | Outlook calendar name to export |
+| `outlook_calendar_index` | int | `2` | Index when multiple calendars share a name |
+| `timezone` | string | *(required)* | IANA timezone (e.g., `America/New_York`) |
+| `sync_days_past` | int | *(required)* | Days of history to sync (1–365) |
+| `sync_days_future` | int | *(required)* | Days ahead to sync (1–365) |
+| `api_delay_seconds` | float | `1.05` | Delay between Google API calls |
+| `max_ics_age_hours` | float | `2.0` | Max ICS file age before refusing to sync |
+| `enable_notifications` | bool | `true` | macOS notifications on changes/failures |
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `WG_PANEL_USER` | Login username | admin |
-| `WG_PANEL_PASS` | Plain text password | (none) |
-| `WG_PANEL_PASS_HASH` | SHA256 password hash | (none) |
-| `WG_PANEL_DB` | Database file path | /opt/wg-panel/wg-panel.db |
-| `WG_INTERFACE` | WireGuard interface to manage | auto-detected |
-
-### Multi-Interface Setup
-
-If you have multiple WireGuard interfaces (e.g., wg0, wg1), set `WG_INTERFACE` in the service file:
-
-```ini
-Environment="WG_INTERFACE=wg1"
-```
-
-Or select the interface in the web panel's Settings page.
-
-### Changing Credentials
-
-**Option 1: Environment Variables (recommended for production)**
-
-```bash
-# Generate password hash
-echo -n "yourpassword" | sha256sum | cut -d' ' -f1
-
-# Edit service file
-sudo systemctl edit wg-panel --full
-# Add/modify:
-# Environment="WG_PANEL_USER=yourusername"
-# Environment="WG_PANEL_PASS_HASH=yourhash"
-
-sudo systemctl restart wg-panel
-```
-
-**Option 2: Web Interface**
-
-Go to Settings -> Account Settings to change username/password (only if not set via environment variables).
-
-### Reverse Proxy (Nginx)
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name vpn.example.com;
-
-    ssl_certificate /path/to/cert.pem;
-    ssl_certificate_key /path/to/key.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-### Cloudflare Tunnel
-
-LeathGuard works great with Cloudflare Tunnels for secure external access without opening ports.
-
-## Updates
-
-### Manual Update
-
-```bash
-sudo leathguard update
-```
-
-### Automatic Updates
-
-Enable in Settings -> Updates -> Automatic Updates, or manually:
-
-```bash
-# Create cron job for daily 3 AM updates
-echo '0 3 * * * root /opt/wg-panel/update.sh >> /var/log/leathguard-update.log 2>&1' | sudo tee /etc/cron.d/leathguard-autoupdate
-```
-
-### Update Notifications
-
-The dashboard shows a banner when updates are available. Click "Update Now" to apply.
-
-## Migration
-
-If you have an existing installation at a non-standard path:
-
-```bash
-cd /path/to/current/installation
-sudo ./migrate.sh
-```
-
-This will:
-1. Move files to `/opt/wg-panel`
-2. Recreate the Python virtual environment
-3. Update systemd service
-4. Standardize service name to `wg-panel`
-5. Preserve your database and settings
-
-## Troubleshooting
-
-### Service won't start
-
-```bash
-# Check logs
-sudo journalctl -u wg-panel -n 50 --no-pager
-
-# Common issues:
-# - Missing venv: sudo python3 -m venv /opt/wg-panel/venv && sudo /opt/wg-panel/venv/bin/pip install flask
-# - Wrong permissions: sudo chown -R root:root /opt/wg-panel
-# - Port in use: Check if another service is using port 5000
-```
-
-### Can't login
-
-```bash
-# Reset password via environment variable
-sudo systemctl edit wg-panel --full
-# Add: Environment="WG_PANEL_PASS=newpassword"
-sudo systemctl restart wg-panel
-```
-
-### WireGuard interface not detected
-
-```bash
-# Check WireGuard is running
-sudo wg show
-
-# Specify interface explicitly
-sudo systemctl edit wg-panel --full
-# Add: Environment="WG_INTERFACE=wg0"
-sudo systemctl restart wg-panel
-```
-
-### Database issues
-
-```bash
-# Database location
-ls -la /opt/wg-panel/wg-panel.db
-
-# Reset database (WARNING: loses all settings)
-sudo rm /opt/wg-panel/wg-panel.db
-sudo systemctl restart wg-panel
-```
+---
 
 ## File Structure
 
 ```
-/opt/wg-panel/
-├── wg-panel/
-│   └── app.py          # Main Flask application
-├── wg-tool             # WireGuard CLI tool
-├── leathguard          # Global CLI tool
-├── install.sh          # Installation script
-├── update.sh           # Update script
-├── migrate.sh          # Migration script
-├── status.sh           # Status check script
-├── VERSION             # Current version
-├── venv/               # Python virtual environment
-└── wg-panel.db         # SQLite database (created at runtime)
-
-/usr/local/sbin/wg-tool     # Symlink to wg-tool
-/usr/local/bin/leathguard   # Symlink to leathguard CLI
-/etc/systemd/system/wg-panel.service  # Systemd service
+~/calendarBridge/
+├── safe_sync.py              # Core sync engine
+├── full_sync.sh              # Entry point (export + sync)
+├── maintenance.sh            # Health check + log cleanup + auto-recovery
+├── cleanup_duplicates.py     # Duplicate removal tool (manual use)
+├── exportEvents.scpt         # AppleScript Outlook exporter
+├── calendar_config.json      # Sync configuration
+├── credentials.json          # Google OAuth credentials (not in git)
+├── token.json                # Google auth token (not in git)
+├── sync_state.json           # Event tracking state (not in git)
+├── requirements.txt          # Python dependencies (pinned)
+├── .venv/                    # Python virtual environment
+├── outbox/                   # Exported ICS files
+├── logs/                     # Sync and maintenance logs
+│   ├── full_sync_*.log       # Per-sync logs (14-day retention)
+│   ├── cron-sync.log         # Cron fallback output
+│   ├── maintenance.log       # Health check history
+│   └── maintenance-cron.log  # Cron maintenance output
+└── launchd/
+    └── com.calendarbridge.sync.plist
 ```
 
-## API Endpoints
+---
 
-LeathGuard provides a REST API (requires authentication):
+## Commands
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/status` | GET | Server and WireGuard status |
-| `/api/clients` | GET | List all clients |
-| `/api/health` | GET | Health check with version |
-| `/api/updates/check` | GET | Check for updates |
-| `/api/updates/apply` | POST | Apply available update |
-| `/api/settings/interface` | GET/POST | Get/set WireGuard interface |
-| `/api/settings/auto-update` | GET/POST | Get/set auto-update setting |
+```bash
+# Manual sync
+cd ~/calendarBridge && ./full_sync.sh
 
-## Security Considerations
+# Check last sync
+tail -10 $(ls -t ~/calendarBridge/logs/full_sync_*.log | head -1)
 
-- **Always use HTTPS** in production (via reverse proxy or Cloudflare Tunnel)
-- **Change default credentials** immediately after installation
-- **Use environment variables** for credentials in production
-- **Restrict network access** to the panel (firewall, VPN-only, etc.)
-- **Keep updated** - enable auto-updates or check regularly
+# Run health check
+./maintenance.sh
 
-## Contributing
+# Check if LaunchAgent is loaded
+launchctl list | grep calendarbridge
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
+# Reload LaunchAgent (if stalled)
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.calendarbridge.sync.plist 2>/dev/null
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.calendarbridge.sync.plist
 
-## License
+# Check cron jobs
+crontab -l
 
-MIT License - see LICENSE file for details.
+# Dry-run duplicate cleanup
+python3 cleanup_duplicates.py
 
-## Acknowledgments
+# Apply duplicate cleanup
+python3 cleanup_duplicates.py --apply
+```
 
-- WireGuard is a registered trademark of Jason A. Donenfeld
-- Built with Flask, SQLite, and vanilla JavaScript
-- Dark theme inspired by modern dashboard designs
+---
+
+## Troubleshooting
+
+**"ICS file is X hours old"** — Outlook wasn't running when the sync fired. Open Outlook and run `./full_sync.sh` manually.
+
+**LaunchAgent not firing** — Common after sleep/wake. The cron fallback handles this automatically. To fix immediately: reload with `launchctl bootout`/`bootstrap` commands above.
+
+**Token expired** — Delete `token.json` and run `./full_sync.sh` to re-authenticate via browser.
+
+**Config validation errors** — Check `calendar_config.json` for typos. Error messages are specific.
+
+**No macOS notifications** — Check System Settings → Notifications → Script Editor is allowed.
+
+---
+
+## Changelog
+
+### v7.0.2 (2026-04-03)
+- Added cron fallback sync (every 30 min) to survive LaunchAgent sleep/wake failures
+- Maintenance auto-recovery: reloads agent and triggers sync when stale >2 hours (was warn-only)
+- Staleness threshold lowered from 24h to 2h for faster detection
+
+### v7.0.1 (2026-03-20)
+- Timezone-safe key matching (Google API returns times in user's current timezone; keys now normalized to config timezone before comparison)
+- Fixed duplicate crisis caused by timezone key mismatch (~9,000 duplicates cleaned)
+
+### v7.0.0 (2026-03-20)
+- Atomic state file writes (crash-safe via temp+rename)
+- ICS staleness guard (configurable max age, default 2h)
+- Exponential backoff on Google API rate limits (429) and server errors (5xx)
+- Config validation on startup with clear error messages
+- macOS notifications on sync failures and significant changes
+- Single LaunchAgent replaces all previous agents
+- Pinned Python dependencies
+- Merged wrapper — `full_sync.sh` handles everything
+- Removed deprecated `clean_ics_files.py`

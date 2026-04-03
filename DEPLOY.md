@@ -1,4 +1,4 @@
-# CalendarBridge v7.0.0 — New Mac Deployment
+# CalendarBridge v7.0.2 — New Mac Deployment
 
 ## Prerequisites
 
@@ -35,7 +35,7 @@ Copy `credentials.json` from your old Mac:
 
 Or generate fresh from Google Cloud Console → APIs & Services → Credentials.
 
-### 4. Create outbox directory
+### 4. Create directories
 
 ```bash
 mkdir -p ~/calendarBridge/outbox
@@ -50,7 +50,7 @@ Open Outlook. If it's in New Outlook, toggle "Revert to Legacy Outlook."
 
 ```bash
 cd ~/calendarBridge
-chmod +x full_sync.sh
+chmod +x full_sync.sh maintenance.sh
 ./full_sync.sh
 ```
 
@@ -71,24 +71,38 @@ launchctl bootout gui/$(id -u)/com.calendarbridge.sync 2>/dev/null || true
 
 # Install new agent
 cp ~/calendarBridge/launchd/com.calendarbridge.sync.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.calendarbridge.sync.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.calendarbridge.sync.plist
 ```
 
 ### 8. Verify it's running
 
 ```bash
 launchctl list | grep calendarbridge
-# Should show: -  0  com.calendarbridge.sync
+# Should show a PID and com.calendarbridge.sync
 ```
 
-### 9. Disable on old Mac
+### 9. Install cron jobs
 
-On the OLD MacBook, stop the LaunchAgent so only one machine syncs:
+The LaunchAgent can silently stop firing after macOS sleep/wake cycles. Cron provides a reliable fallback:
+
+```bash
+(crontab -l 2>/dev/null; echo "*/30 * * * * /Users/$(whoami)/calendarBridge/full_sync.sh >> /Users/$(whoami)/calendarBridge/logs/cron-sync.log 2>&1"; echo "0 8 * * * /Users/$(whoami)/calendarBridge/maintenance.sh >> /Users/$(whoami)/calendarBridge/logs/maintenance-cron.log 2>&1") | crontab -
+crontab -l
+```
+
+You should see two entries:
+- `*/30` — sync fallback every 30 minutes
+- `0 8` — daily maintenance (health check, log cleanup, state backup, auto-recovery)
+
+### 10. Disable on old Mac
+
+On the OLD MacBook, stop everything so only one machine syncs:
 
 ```bash
 launchctl bootout gui/$(id -u)/net.leathermans.calendarbridge 2>/dev/null || true
 launchctl bootout gui/$(id -u)/net.leathermans.calendarbridge.maintenance 2>/dev/null || true
 launchctl bootout gui/$(id -u)/com.calendarbridge.sync 2>/dev/null || true
+crontab -r 2>/dev/null || true  # Remove all cron jobs (review first if you have others)
 ```
 
 ## Verify Everything Works
@@ -106,22 +120,11 @@ print(f\"Last sync: {s.get('last_sync', 'never')}\")
 "
 
 # Run health check
-chmod +x ~/calendarBridge/maintenance.sh
 ~/calendarBridge/maintenance.sh
+
+# Verify cron
+crontab -l
 ```
-
-## What Changed in v7.0.0
-
-1. **ICS staleness guard** — refuses to sync data older than 2 hours (configurable via `max_ics_age_hours`). Prevents stale data from deleting recent events.
-2. **Atomic state writes** — sync_state.json can't be corrupted by crashes or power loss.
-3. **Single LaunchAgent** — `com.calendarbridge.sync` replaces all previous agents.
-4. **Pinned dependencies** — all Python packages version-locked.
-5. **Exponential backoff** — rate limits (429) and server errors (5xx) retry with backoff instead of failing.
-6. **Merged wrapper** — `full_sync.sh` handles everything (no more `run_sync_wrapper.sh`).
-7. **Config validation** — typos in `calendar_config.json` caught immediately with clear errors.
-8. **macOS notifications** — alerts on sync failures and significant changes.
-9. **Streamlined logging** — single log path, no duplicate output.
-10. **Removed dead code** — `clean_ics_files.py` deprecated (unused since v6.1).
 
 ## Troubleshooting
 
@@ -132,3 +135,5 @@ chmod +x ~/calendarBridge/maintenance.sh
 **No macOS notifications** — Check System Settings → Notifications → Script Editor is allowed.
 
 **Token expired** — Delete `token.json` and run `./full_sync.sh` to re-authenticate.
+
+**LaunchAgent not firing after sleep** — This is expected macOS behavior. The cron fallback (step 9) handles it automatically. To fix immediately: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.calendarbridge.sync.plist 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.calendarbridge.sync.plist`

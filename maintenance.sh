@@ -78,8 +78,11 @@ health_check() {
         local now
         now=$(date +%s)
         local age_hours=$(( (now - last_mtime) / 3600 ))
-        if [ "${age_hours}" -gt 24 ]; then
-            log "WARN: Last sync was ${age_hours}h ago"
+        if [ "${age_hours}" -gt 2 ]; then
+            log "WARN: Last sync was ${age_hours}h ago — reloading agent and triggering sync"
+            launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/${AGENT_LABEL}.plist 2>/dev/null
+            launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/${AGENT_LABEL}.plist 2>/dev/null
+            "${ROOT}/full_sync.sh" >> "${LOG_DIR}/maintenance-recovery.log" 2>&1 &
         fi
     else
         log "WARN: No sync logs found"
