@@ -3,7 +3,7 @@
   "outlook_calendar_index": 2,
   "google_calendar_id": "brett@leathermans.net",
   "sync_days_past": 60,
-  "sync_days_future": 90,
+  "sync_days_future": 180,
   "api_delay_seconds": 1.05,
   "timezone": "America/New_York",
   "max_ics_age_hours": 2.0,
