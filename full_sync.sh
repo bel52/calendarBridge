@@ -101,7 +101,7 @@ c = json.load(open('${ROOT}/calendar_config.json'))
 print(c.get('outlook_calendar_index', 2))
 " 2>/dev/null || echo "2")
 
-    if osascript "${ROOT}/exportEvents.scpt" "${CAL_NAME}" "${CAL_INDEX}" >> "${LOG_FILE}" 2>&1; then
+    if "${ROOT}/.venv/bin/python" "${ROOT}/export_events_db.py" >> "${LOG_FILE}" 2>&1; then
         log "Export OK"
     else
         log "Export failed"

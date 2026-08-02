@@ -35,3 +35,4 @@ sync_state_backup.json
 
 # Backups
 *.bak*
+outbox/.export_db_state.json
