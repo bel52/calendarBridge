@@ -901,6 +901,32 @@ def main():
     # Save state (atomic)
     state.save()
 
+    # Heartbeat (T8): one sentinel event per calendar, updated on every completed pass.
+    # Outside the sync window and never tagged source=CalendarBridge, so orphan deletion ignores it.
+    try:
+        hb = service.events().list(
+            calendarId=cal_id, privateExtendedProperty="cb_heartbeat=1",
+            maxResults=5, showDeleted=False,
+        ).execute().get("items", [])
+        hb_body = {
+            "summary": "CalendarBridge heartbeat",
+            "start": {"date": "2000-01-01"}, "end": {"date": "2000-01-02"},
+            "transparency": "transparent", "visibility": "private",
+            "description": (
+                f"last_ok={datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+                f"created={stats['created']} updated={stats['updated']} deleted={stats['deleted']} "
+                f"failed={stats['failed']} skipped={stats['skipped']} v={VERSION}"
+            ),
+            "extendedProperties": {"private": {"cb_heartbeat": "1"}},
+        }
+        if hb:
+            service.events().patch(calendarId=cal_id, eventId=hb[0]["id"], body=hb_body).execute()
+        else:
+            service.events().insert(calendarId=cal_id, body=hb_body).execute()
+        log.info("Heartbeat updated")
+    except Exception as e:
+        log.warning(f"Heartbeat update failed (sync unaffected): {e}")
+
     elapsed = time.time() - start_time
     log.info("=" * 60)
     log.info(f"SYNC COMPLETE in {elapsed:.1f}s")
